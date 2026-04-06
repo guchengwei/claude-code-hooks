@@ -97,6 +97,25 @@ else
   echo "  Done."
 fi
 
+# Rewrite relative hook paths to absolute in settings.json (required for --global)
+rewrite_global_paths() {
+  local file="$1"
+  local home_dir="$2"
+  jq --arg home "$home_dir" '
+    .hooks |= with_entries(
+      .value |= map(
+        .hooks |= map(
+          if (.command // "") | startswith(".claude/hooks/")
+          then .command = ($home + "/.claude/hooks/" +
+                 (.command | ltrimstr(".claude/hooks/")))
+          else .
+          end
+        )
+      )
+    )
+  ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
 # Rewrite relative hook paths to absolute for global installs
 if $GLOBAL; then
   rewrite_global_paths "$CLAUDE_DIR/settings.json" "$HOME"
@@ -141,25 +160,6 @@ fi
 if [ "${#LANGUAGES[@]}" -gt 0 ]; then
   echo "  Languages: ${LANGUAGES[*]}"
 fi
-
-# Rewrite relative hook paths to absolute in settings.json (required for --global)
-rewrite_global_paths() {
-  local file="$1"
-  local home_dir="$2"
-  jq --arg home "$home_dir" '
-    .hooks |= with_entries(
-      .value |= map(
-        .hooks |= map(
-          if (.command // "") | startswith(".claude/hooks/")
-          then .command = ($home + "/.claude/hooks/" +
-                 (.command | ltrimstr(".claude/hooks/")))
-          else .
-          end
-        )
-      )
-    )
-  ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
-}
 
 # Install tools per language
 # python_install_package: cascade installer for PEP 668 systems.
