@@ -8,8 +8,8 @@ dangerous_patterns=(
   "git push.*--force"
   "DROP TABLE"
   "DROP DATABASE"
-  "curl.*|.*sh"
-  "wget.*|.*bash"
+  "curl[^|]*\|[^|]*(ba)?sh"
+  "wget[^|]*\|[^|]*(ba)?sh"
 )
 
 for pattern in "${dangerous_patterns[@]}"; do
