@@ -1,7 +1,7 @@
 ---
 title: "fix: Installer UX Issues (URL, global paths, Python cascade, hook guards, self-install)"
 type: fix
-status: active
+status: completed
 date: 2026-04-06
 origin: docs/brainstorms/installer-ux-fixes-requirements.md
 ---
