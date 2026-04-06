@@ -2,46 +2,53 @@
 
 Drop-in hooks for Claude Code that enforce code quality, block dangerous commands, and automate common tasks. Works with Node.js, Python, Go, and Rust projects.
 
+## Prerequisites
+
+- **bash** 4+
+- **jq** — required for `--global` installs and settings merging (`apt install jq` / `brew install jq`)
+
 ## Quick Start
 
 ```bash
-# Clone this repo
-git clone https://github.com/<your-username>/claude-code-hooks ~/claude-code-hooks
+# Clone this repo (fork first if you want to customize hooks)
+git clone https://github.com/guchengwei/claude-code-hooks ~/claude-code-hooks
 
-# Install into your project
+# Install into your project — run from inside your project, not from this repo
 cd /path/to/your-project
 ~/claude-code-hooks/install.sh .
 
-# Or install globally (applies to all projects)
+# Or install globally (applies to all projects; requires jq)
 ~/claude-code-hooks/install.sh --global
 
 # Start Claude Code
 claude
 ```
 
+> **Note:** Do not open the `claude-code-hooks` directory itself in Claude Code. Run `install.sh` from your target project directory.
+
 ## What's Included
 
-| Hook | Type | What It Does |
-|------|------|-------------|
-| `block-dangerous.sh` | PreToolUse (Bash) | Blocks `rm -rf`, `git reset --hard`, `git push --force`, `DROP TABLE`, piped curl/wget |
-| `protect-files.sh` | PreToolUse (Edit/Write) | Blocks edits to `.env`, lock files, `.pem`, `.key`, `secrets/` |
-| `require-tests-for-pr.sh` | PreToolUse (PR creation) | Runs all test suites before allowing PR creation |
-| `format-file.sh` | PostToolUse (Write/Edit) | Auto-formats files by extension (prettier, black, gofmt, rustfmt) |
-| `lint-file.sh` | PostToolUse (Write/Edit) | Auto-lints files by extension (eslint, ruff) |
-| `run-tests.sh` | PostToolUse (Write/Edit) | Runs all detected test suites after each edit |
-| `log-commands.sh` | PreToolUse (Bash) | Logs all commands with timestamps to `.claude/command-log.txt` |
-| `auto-commit.sh` | Stop | Auto-commits all changes when Claude stops |
+| Hook                      | Type                     | What It Does                                                                           |
+| ------------------------- | ------------------------ | -------------------------------------------------------------------------------------- |
+| `block-dangerous.sh`      | PreToolUse (Bash)        | Blocks `rm -rf`, `git reset --hard`, `git push --force`, `DROP TABLE`, piped curl/wget |
+| `protect-files.sh`        | PreToolUse (Edit/Write)  | Blocks edits to `.env`, lock files, `.pem`, `.key`, `secrets/`                         |
+| `require-tests-for-pr.sh` | PreToolUse (PR creation) | Runs all test suites before allowing PR creation                                       |
+| `format-file.sh`          | PostToolUse (Write/Edit) | Auto-formats files by extension (prettier, black, gofmt, rustfmt)                      |
+| `lint-file.sh`            | PostToolUse (Write/Edit) | Auto-lints files by extension (eslint, ruff)                                           |
+| `run-tests.sh`            | PostToolUse (Write/Edit) | Runs all detected test suites after each edit                                          |
+| `log-commands.sh`         | PreToolUse (Bash)        | Logs all commands with timestamps to `.claude/command-log.txt`                         |
+| `auto-commit.sh`          | Stop                     | Auto-commits all changes when Claude stops                                             |
 
 ## Multi-Language Support
 
 The installer auto-detects your project's languages and configures the right tools:
 
-| Language | Formatter | Linter | Test Runner |
-|----------|-----------|--------|-------------|
-| Node.js | prettier | eslint | npm test |
-| Python | black | ruff | pytest |
-| Go | gofmt | golangci-lint | go test |
-| Rust | rustfmt | clippy | cargo test |
+| Language | Formatter | Linter        | Test Runner |
+| -------- | --------- | ------------- | ----------- |
+| Node.js  | prettier  | eslint        | npm test    |
+| Python   | black     | ruff          | pytest      |
+| Go       | gofmt     | golangci-lint | go test     |
+| Rust     | rustfmt   | clippy        | cargo test  |
 
 For multi-language projects (e.g. Node + Python), all tools are configured simultaneously. Hook scripts dispatch by file extension.
 
@@ -52,12 +59,15 @@ If no language markers are found, the installer asks which languages you plan to
 ## Customization
 
 ### Disable a specific hook
+
 Remove or comment out the corresponding entry in `.claude/settings.json`.
 
 ### Add your own patterns to block-dangerous.sh
+
 Edit `.claude/hooks/block-dangerous.sh` and add patterns to the `dangerous_patterns` array.
 
 ### Add protected files
+
 Edit `.claude/hooks/protect-files.sh` and add patterns to the `protected` array.
 
 ## How Hooks Work
