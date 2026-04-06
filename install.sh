@@ -16,6 +16,21 @@ done
 
 if $GLOBAL; then
   TARGET_DIR="$HOME"
+  if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required for --global installs. Install it with 'apt install jq' or 'brew install jq'." >&2
+    exit 1
+  fi
+fi
+
+# Canonicalize TARGET_DIR for self-detection (skip if directory doesn't exist yet)
+if [ -d "$TARGET_DIR" ]; then
+  CANONICAL_TARGET="$(realpath "$TARGET_DIR" 2>/dev/null || (cd -P "$TARGET_DIR" 2>/dev/null && pwd))"
+  if [ -n "$CANONICAL_TARGET" ] && [ "$CANONICAL_TARGET" = "$SCRIPT_DIR" ]; then
+    echo "Error: Cannot install into the hooks repo itself." >&2
+    echo "Run install.sh from your target project directory:" >&2
+    echo "  cd /path/to/your-project && $SCRIPT_DIR/install.sh ." >&2
+    exit 1
+  fi
 fi
 
 CLAUDE_DIR="$TARGET_DIR/.claude"
@@ -82,6 +97,31 @@ else
   echo "  Done."
 fi
 
+# Rewrite relative hook paths to absolute in settings.json (required for --global)
+rewrite_global_paths() {
+  local file="$1"
+  local home_dir="$2"
+  jq --arg home "$home_dir" '
+    .hooks |= with_entries(
+      .value |= map(
+        .hooks |= map(
+          if (.command // "") | startswith(".claude/hooks/")
+          then .command = ($home + "/.claude/hooks/" +
+                 (.command | ltrimstr(".claude/hooks/")))
+          else .
+          end
+        )
+      )
+    )
+  ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+# Rewrite relative hook paths to absolute for global installs
+if $GLOBAL; then
+  rewrite_global_paths "$CLAUDE_DIR/settings.json" "$HOME"
+  echo "  Rewrote hook paths to absolute (global install)."
+fi
+
 # Detect languages
 echo ""
 echo "Detecting project languages..."
@@ -122,6 +162,64 @@ if [ "${#LANGUAGES[@]}" -gt 0 ]; then
 fi
 
 # Install tools per language
+# python_install_package: cascade installer for PEP 668 systems.
+# Assumes binary name == package name (valid for black, ruff, pytest).
+python_install_package() {
+  local pkg="$1"
+  local label="$2"
+
+  # Check if already installed in active venv
+  if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/$pkg" ]; then
+    echo "  $label ($pkg) -- already installed (venv)"
+    return
+  fi
+
+  # Check system PATH
+  if command -v "$pkg" &>/dev/null; then
+    echo "  $label ($pkg) -- already installed"
+    return
+  fi
+
+  # Prompt (skip in non-interactive environments)
+  local answer=""
+  [ -t 0 ] && read -rp "  $label ($pkg) not found. Install? [Y/n]: " answer
+  if [[ "$answer" =~ ^[Nn]$ ]]; then
+    echo "  WARNING: $pkg not installed. To enable:" >&2
+    echo "    Ubuntu: apt install pipx && pipx install $pkg" >&2
+    echo "    macOS:  brew install pipx && pipx install $pkg" >&2
+    return
+  fi
+
+  # Try venv pip
+  if [ -n "${VIRTUAL_ENV:-}" ]; then
+    if "$VIRTUAL_ENV/bin/pip" install "$pkg" 2>/dev/null; then
+      echo "  $label ($pkg) -- installed via venv pip"
+      return
+    fi
+  fi
+
+  # Try uv
+  if command -v uv &>/dev/null; then
+    if uv tool install "$pkg" 2>/dev/null; then
+      echo "  $label ($pkg) -- installed via uv"
+      return
+    fi
+  fi
+
+  # Try pipx
+  if command -v pipx &>/dev/null; then
+    if pipx install "$pkg" 2>/dev/null; then
+      echo "  $label ($pkg) -- installed via pipx"
+      return
+    fi
+  fi
+
+  # All attempts failed
+  echo "  WARNING: $pkg not installed. To enable:" >&2
+  echo "    Ubuntu: apt install pipx && pipx install $pkg" >&2
+  echo "    macOS:  brew install pipx && pipx install $pkg" >&2
+}
+
 install_if_missing() {
   local cmd="$1"
   local install_cmd="$2"
@@ -149,9 +247,9 @@ for lang in "${LANGUAGES[@]+"${LANGUAGES[@]}"}"; do
       ;;
     python)
       echo "Setting up Python tools..."
-      install_if_missing "black" "pip install black" "Formatter"
-      install_if_missing "ruff" "pip install ruff" "Linter"
-      install_if_missing "pytest" "pip install pytest" "Test runner"
+      python_install_package "black" "Formatter"
+      python_install_package "ruff" "Linter"
+      python_install_package "pytest" "Test runner"
       ;;
     go)
       echo "Setting up Go tools..."
@@ -164,17 +262,31 @@ for lang in "${LANGUAGES[@]+"${LANGUAGES[@]}"}"; do
   esac
 done
 
-# Update .gitignore
-if [ -f "$TARGET_DIR/.gitignore" ]; then
-  if ! grep -q ".claude/command-log.txt" "$TARGET_DIR/.gitignore"; then
-    echo ".claude/command-log.txt" >> "$TARGET_DIR/.gitignore"
+# Update .gitignore (skip for --global to avoid silently writing ~/.gitignore)
+if ! $GLOBAL; then
+  if [ -f "$TARGET_DIR/.gitignore" ]; then
+    if ! grep -q ".claude/command-log.txt" "$TARGET_DIR/.gitignore"; then
+      echo ".claude/command-log.txt" >> "$TARGET_DIR/.gitignore"
+      echo ""
+      echo "Added .claude/command-log.txt to .gitignore"
+    fi
+  else
+    echo ".claude/command-log.txt" > "$TARGET_DIR/.gitignore"
     echo ""
-    echo "Added .claude/command-log.txt to .gitignore"
+    echo "Created .gitignore with .claude/command-log.txt"
   fi
-elif [ ! "$GLOBAL" = true ]; then
-  echo ".claude/command-log.txt" > "$TARGET_DIR/.gitignore"
-  echo ""
-  echo "Created .gitignore with .claude/command-log.txt"
+fi
+
+# Set fallback git identity if the target is a git repo and no identity is configured
+if git -C "$TARGET_DIR" rev-parse --git-dir &>/dev/null 2>&1; then
+  if ! git -C "$TARGET_DIR" config user.email &>/dev/null; then
+    git -C "$TARGET_DIR" config user.email "claude-code@localhost"
+    git -C "$TARGET_DIR" config user.name  "Claude Code"
+    echo ""
+    echo "Set default git identity (claude-code@localhost) — replace with your own:"
+    echo "  git config user.email \"you@example.com\""
+    echo "  git config user.name  \"Your Name\""
+  fi
 fi
 
 # Summary
