@@ -37,23 +37,35 @@ echo "  Installed $(ls "$HOOKS_DIR/"*.sh | wc -l | tr -d ' ') hook scripts"
 echo "Copying settings.json..."
 if [ -f "$CLAUDE_DIR/settings.json" ]; then
   if command -v jq &>/dev/null; then
-    echo "  Existing settings.json found — merging hooks..."
-    merged=$(jq -s '
-      def merge_hooks(a; b):
-        (a + b) | group_by(.matcher) | map(
-          { matcher: .[0].matcher, hooks: (map(.hooks) | add | unique) }
-        );
-      .[0] as $existing | .[1] as $new |
-      $existing | .hooks = (
-        ($existing.hooks // {}) + {
-          PreToolUse:  merge_hooks(($existing.hooks.PreToolUse  // []);  ($new.hooks.PreToolUse  // [])),
-          PostToolUse: merge_hooks(($existing.hooks.PostToolUse // []); ($new.hooks.PostToolUse // [])),
-          Stop:        merge_hooks(($existing.hooks.Stop        // []);  ($new.hooks.Stop        // []))
-        }
-      )
-    ' "$CLAUDE_DIR/settings.json" "$SCRIPT_DIR/.claude/settings.json")
-    echo "$merged" > "$CLAUDE_DIR/settings.json"
-    echo "  Merged."
+    if ! jq empty "$CLAUDE_DIR/settings.json" 2>/dev/null; then
+      echo "  Existing settings.json is malformed — cannot merge."
+      overwrite=""
+      [ -t 0 ] && read -rp "  Overwrite with bundled settings.json? [y/N]: " overwrite
+      if [[ "$overwrite" =~ ^[Yy]$ ]]; then
+        cp "$SCRIPT_DIR/.claude/settings.json" "$CLAUDE_DIR/settings.json"
+        echo "  Overwritten."
+      else
+        echo "  Skipped (keeping existing settings.json)."
+      fi
+    else
+      echo "  Existing settings.json found — merging hooks..."
+      merged=$(jq -s '
+        def merge_hooks(a; b):
+          (a + b) | group_by(.matcher) | map(
+            { matcher: .[0].matcher, hooks: (map(.hooks) | add | unique) }
+          );
+        .[0] as $existing | .[1] as $new |
+        $existing | .hooks = (
+          ($existing.hooks // {}) + {
+            PreToolUse:  merge_hooks(($existing.hooks.PreToolUse  // []);  ($new.hooks.PreToolUse  // [])),
+            PostToolUse: merge_hooks(($existing.hooks.PostToolUse // []); ($new.hooks.PostToolUse // [])),
+            Stop:        merge_hooks(($existing.hooks.Stop        // []);  ($new.hooks.Stop        // []))
+          }
+        )
+      ' "$CLAUDE_DIR/settings.json" "$SCRIPT_DIR/.claude/settings.json")
+      echo "$merged" > "$CLAUDE_DIR/settings.json"
+      echo "  Merged."
+    fi
   else
     echo "  (jq not found — cannot auto-merge)"
     overwrite=""
