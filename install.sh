@@ -277,6 +277,18 @@ if ! $GLOBAL; then
   fi
 fi
 
+# Set fallback git identity if the target is a git repo and no identity is configured
+if git -C "$TARGET_DIR" rev-parse --git-dir &>/dev/null 2>&1; then
+  if ! git -C "$TARGET_DIR" config user.email &>/dev/null; then
+    git -C "$TARGET_DIR" config user.email "claude-code@localhost"
+    git -C "$TARGET_DIR" config user.name  "Claude Code"
+    echo ""
+    echo "Set default git identity (claude-code@localhost) — replace with your own:"
+    echo "  git config user.email \"you@example.com\""
+    echo "  git config user.name  \"Your Name\""
+  fi
+fi
+
 # Summary
 echo ""
 echo "=== Installation Complete ==="
