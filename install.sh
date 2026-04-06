@@ -33,15 +33,34 @@ cp "$SCRIPT_DIR/.claude/hooks/"*.sh "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/"*.sh
 echo "  Installed $(ls "$HOOKS_DIR/"*.sh | wc -l | tr -d ' ') hook scripts"
 
-# Copy settings.json
+# Copy/merge settings.json
 echo "Copying settings.json..."
 if [ -f "$CLAUDE_DIR/settings.json" ]; then
-  read -rp "  settings.json already exists. Overwrite? [y/N]: " overwrite
-  if [[ "$overwrite" =~ ^[Yy]$ ]]; then
-    cp "$SCRIPT_DIR/.claude/settings.json" "$CLAUDE_DIR/settings.json"
-    echo "  Overwritten."
+  if command -v jq &>/dev/null; then
+    echo "  Existing settings.json found — merging hooks..."
+    merged=$(jq -s '
+      def merge_hooks(a; b):
+        (a + b) | group_by(.matcher) | map(
+          { matcher: .[0].matcher, hooks: (map(.hooks) | add | unique) }
+        );
+      .[0] as $existing | .[1] as $new |
+      $existing | .hooks = {
+        PreToolUse:  merge_hooks(($existing.hooks.PreToolUse  // []);  ($new.hooks.PreToolUse  // [])),
+        PostToolUse: merge_hooks(($existing.hooks.PostToolUse // []); ($new.hooks.PostToolUse // [])),
+        Stop:        merge_hooks(($existing.hooks.Stop        // []);  ($new.hooks.Stop        // []))
+      }
+    ' "$CLAUDE_DIR/settings.json" "$SCRIPT_DIR/.claude/settings.json")
+    echo "$merged" > "$CLAUDE_DIR/settings.json"
+    echo "  Merged."
   else
-    echo "  Skipped (keeping existing settings.json)."
+    echo "  (jq not found — cannot auto-merge)"
+    read -rp "  Overwrite existing settings.json? [y/N]: " overwrite
+    if [[ "$overwrite" =~ ^[Yy]$ ]]; then
+      cp "$SCRIPT_DIR/.claude/settings.json" "$CLAUDE_DIR/settings.json"
+      echo "  Overwritten."
+    else
+      echo "  Skipped (keeping existing settings.json)."
+    fi
   fi
 else
   cp "$SCRIPT_DIR/.claude/settings.json" "$CLAUDE_DIR/settings.json"
@@ -63,6 +82,19 @@ if [ "${#LANGUAGES[@]}" -eq 0 ]; then
   read -rp "  Which languages will you use? (comma-separated: node,python,go,rust,skip): " lang_input
   if [ "$lang_input" != "skip" ] && [ -n "$lang_input" ]; then
     IFS=',' read -ra LANGUAGES <<< "$lang_input"
+  fi
+else
+  echo "  Detected: ${LANGUAGES[*]}"
+  read -rp "  Add more languages? (comma-separated: node,python,go,rust, or press Enter to skip): " lang_extra
+  if [ -n "$lang_extra" ]; then
+    IFS=',' read -ra EXTRA <<< "$lang_extra"
+    for lang in "${EXTRA[@]}"; do
+      lang=$(echo "$lang" | tr -d ' ')
+      # avoid duplicates
+      if [[ ! " ${LANGUAGES[*]} " =~ " ${lang} " ]]; then
+        LANGUAGES+=("$lang")
+      fi
+    done
   fi
 fi
 
