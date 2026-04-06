@@ -44,17 +44,20 @@ if [ -f "$CLAUDE_DIR/settings.json" ]; then
           { matcher: .[0].matcher, hooks: (map(.hooks) | add | unique) }
         );
       .[0] as $existing | .[1] as $new |
-      $existing | .hooks = {
-        PreToolUse:  merge_hooks(($existing.hooks.PreToolUse  // []);  ($new.hooks.PreToolUse  // [])),
-        PostToolUse: merge_hooks(($existing.hooks.PostToolUse // []); ($new.hooks.PostToolUse // [])),
-        Stop:        merge_hooks(($existing.hooks.Stop        // []);  ($new.hooks.Stop        // []))
-      }
+      $existing | .hooks = (
+        ($existing.hooks // {}) + {
+          PreToolUse:  merge_hooks(($existing.hooks.PreToolUse  // []);  ($new.hooks.PreToolUse  // [])),
+          PostToolUse: merge_hooks(($existing.hooks.PostToolUse // []); ($new.hooks.PostToolUse // [])),
+          Stop:        merge_hooks(($existing.hooks.Stop        // []);  ($new.hooks.Stop        // []))
+        }
+      )
     ' "$CLAUDE_DIR/settings.json" "$SCRIPT_DIR/.claude/settings.json")
     echo "$merged" > "$CLAUDE_DIR/settings.json"
     echo "  Merged."
   else
     echo "  (jq not found — cannot auto-merge)"
-    read -rp "  Overwrite existing settings.json? [y/N]: " overwrite
+    overwrite=""
+    [ -t 0 ] && read -rp "  Overwrite existing settings.json? [y/N]: " overwrite
     if [[ "$overwrite" =~ ^[Yy]$ ]]; then
       cp "$SCRIPT_DIR/.claude/settings.json" "$CLAUDE_DIR/settings.json"
       echo "  Overwritten."
@@ -79,22 +82,26 @@ LANGUAGES=()
 
 if [ "${#LANGUAGES[@]}" -eq 0 ]; then
   echo "  No languages detected."
-  read -rp "  Which languages will you use? (comma-separated: node,python,go,rust,skip): " lang_input
-  if [ "$lang_input" != "skip" ] && [ -n "$lang_input" ]; then
-    IFS=',' read -ra LANGUAGES <<< "$lang_input"
+  if [ -t 0 ]; then
+    read -rp "  Which languages will you use? (comma-separated: node,python,go,rust,skip): " lang_input
+    if [ "$lang_input" != "skip" ] && [ -n "$lang_input" ]; then
+      IFS=',' read -ra LANGUAGES <<< "$lang_input"
+    fi
   fi
 else
   echo "  Detected: ${LANGUAGES[*]}"
-  read -rp "  Add more languages? (comma-separated: node,python,go,rust, or press Enter to skip): " lang_extra
-  if [ -n "$lang_extra" ]; then
-    IFS=',' read -ra EXTRA <<< "$lang_extra"
-    for lang in "${EXTRA[@]}"; do
-      lang=$(echo "$lang" | tr -d ' ')
-      # avoid duplicates
-      if [[ ! " ${LANGUAGES[*]} " =~ " ${lang} " ]]; then
-        LANGUAGES+=("$lang")
-      fi
-    done
+  if [ -t 0 ]; then
+    read -rp "  Add more languages? (comma-separated: node,python,go,rust, or press Enter to skip): " lang_extra
+    if [ -n "$lang_extra" ]; then
+      IFS=',' read -ra EXTRA <<< "$lang_extra"
+      for lang in "${EXTRA[@]}"; do
+        lang=$(echo "$lang" | tr -d ' ')
+        # avoid duplicates
+        if [[ ! " ${LANGUAGES[*]} " =~ " ${lang} " ]]; then
+          LANGUAGES+=("$lang")
+        fi
+      done
+    fi
   fi
 fi
 
@@ -108,7 +115,8 @@ install_if_missing() {
   local install_cmd="$2"
   local label="$3"
   if ! command -v "$cmd" &>/dev/null; then
-    read -rp "  $label ($cmd) not found. Install? [Y/n]: " answer
+    answer=""
+    [ -t 0 ] && read -rp "  $label ($cmd) not found. Install? [Y/n]: " answer
     if [[ ! "$answer" =~ ^[Nn]$ ]]; then
       echo "  Running: $install_cmd"
       eval "$install_cmd"
