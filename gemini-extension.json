@@ -1,0 +1,5 @@
+{
+  "name": "coding-agent-hooks",
+  "version": "0.1.0",
+  "description": "Portable safety policies and opt-in quality hooks for coding agents"
+}

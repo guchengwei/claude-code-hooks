@@ -1,0 +1,29 @@
+{
+  "description": "Portable coding-agent safety and quality hooks",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agent-hooks\" handle --adapter auto",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agent-hooks\" handle --adapter auto",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

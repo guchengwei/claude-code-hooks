@@ -8,6 +8,8 @@ origin: docs/brainstorms/installer-ux-fixes-requirements.md
 
 # fix: Installer UX Issues
 
+> Superseded by the marketplace-first, agent-neutral core redesign. Retained as historical context for the removed installer.
+
 ## Overview
 
 Six bugs degrade the out-of-box experience for new users. This plan fixes them in a single focused pass: a placeholder README URL, silent global-install failure (relative hook paths never resolve outside `$HOME`), `pip install` failures on PEP 668 systems, missing tool-existence guards in `run-tests.sh`, accidental self-installation when running from inside the repo, and `auto-commit.sh` hard-aborting when git prerequisites (repo, identity, signing key) are missing.

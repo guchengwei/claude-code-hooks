@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": ".*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "name": "coding-agent-hooks-policy",
+            "command": "\"${extensionPath}/plugins/coding-agent-hooks/bin/agent-hooks\" handle --adapter gemini",
+            "description": "Check a tool call against repository safety policy",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": ".*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "name": "coding-agent-hooks-quality",
+            "command": "\"${extensionPath}/plugins/coding-agent-hooks/bin/agent-hooks\" handle --adapter gemini",
+            "description": "Run configured quality commands after file changes",
+            "timeout": 120000
+          }
+        ]
+      }
+    ]
+  }
+}
