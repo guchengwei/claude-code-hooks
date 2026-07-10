@@ -15,10 +15,20 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 
+SHELL_COMMAND_START = (
+    r"(?:^|[;&|(){}`\n]\s*)"
+    r"(?:(?:then|do|else)\s+)?"
+    r"(?:(?:(?:sudo|doas)"
+    r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
+    r"|(?:command|exec|env|nohup|time)"
+    r"(?:\s+(?:-[^\s;&|(){}]+|[A-Za-z_]\w*=[^\s;&|(){}]+))*)\s+)*"
+)
+
 DESTRUCTIVE_COMMANDS = (
     (
         re.compile(
-            r"(^|[;&|]\s*)rm\b"
+            SHELL_COMMAND_START
+            + r"rm\b"
             r"(?=[^;&|\n]*\s-\S*r)"
             r"(?=[^;&|\n]*\s-\S*f)",
             re.IGNORECASE,
@@ -38,6 +48,63 @@ DESTRUCTIVE_COMMANDS = (
         "remote script pipe",
     ),
 )
+
+
+def shell_executable_text(command: str) -> str:
+    """Mask quoted literals but retain executable command substitutions."""
+    executable = [" "] * len(command)
+
+    def scan(index: int, terminator: str | None = None) -> int:
+        while index < len(command):
+            character = command[index]
+            if character == terminator:
+                executable[index] = character
+                return index + 1
+            if character == "'":
+                index += 1
+                while index < len(command) and command[index] != "'":
+                    index += 1
+                index += index < len(command)
+                continue
+            if character == '"':
+                index = scan_double_quote(index + 1)
+                continue
+            if character == "`":
+                executable[index] = character
+                index = scan(index + 1, "`")
+                continue
+            if command.startswith("$(", index):
+                executable[index : index + 2] = "$("
+                index = scan(index + 2, ")")
+                continue
+            if terminator == ")" and character == "(":
+                executable[index] = character
+                index = scan(index + 1, ")")
+                continue
+            executable[index] = character
+            index += 1
+        return index
+
+    def scan_double_quote(index: int) -> int:
+        while index < len(command):
+            if command[index] == '"':
+                return index + 1
+            if command[index] == "\\":
+                index += 2
+                continue
+            if command[index] == "`":
+                executable[index] = "`"
+                index = scan(index + 1, "`")
+                continue
+            if command.startswith("$(", index):
+                executable[index : index + 2] = "$("
+                index = scan(index + 2, ")")
+                continue
+            index += 1
+        return index
+
+    scan(0)
+    return "".join(executable)
 
 EVENT_NAMES = {
     "PreToolUse": "before_tool",
@@ -283,8 +350,9 @@ def evaluate(
         return HookResult("allow")
 
     tool = event.get("tool") or {}
-    command = tool.get("command") or ""
+    command = str(tool.get("command") or "")
     if str(tool.get("name") or "").lower() in SHELL_TOOL_NAMES:
+        command = shell_executable_text(command)
         for pattern, label in DESTRUCTIVE_COMMANDS:
             if pattern.search(command):
                 return HookResult(

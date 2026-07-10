@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Literal
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,28 @@ class PortableHookCliTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def assert_shell_decision(
+        self, command: str, decision: Literal["allow", "deny"]
+    ) -> None:
+        result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {"name": "shell", "command": command},
+            }
+        )
+
+        self.assertEqual(result.returncode, 2 if decision == "deny" else 0)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], decision)
+        if decision == "deny":
+            self.assertEqual(
+                output["message"],
+                "Blocked destructive command: rm -rf",
+            )
 
     def test_dangerous_shell_command_is_denied(self) -> None:
         result = self.run_hook(
@@ -491,6 +514,51 @@ class PortableHookCliTests(unittest.TestCase):
             json.loads(result.stdout)["message"],
             "Blocked destructive command: rm -rf",
         )
+
+    def test_sudo_recursive_forced_delete_is_denied(self) -> None:
+        self.assert_shell_decision(
+            "sudo rm -rf /tmp/agent-hooks-example", "deny"
+        )
+
+    def test_privilege_wrapper_user_option_does_not_hide_delete(self) -> None:
+        for command in (
+            "sudo -u root rm -rf /tmp/example",
+            "doas -u root rm -rf /tmp/example",
+        ):
+            with self.subTest(command=command):
+                self.assert_shell_decision(command, "deny")
+
+    def test_recursive_forced_delete_in_shell_control_flow_is_denied(self) -> None:
+        commands = (
+            "if true; then rm -rf /tmp/example; fi",
+            "while true; do rm --recursive --force /tmp/example; done",
+            "{ rm -fr /tmp/example; }",
+            "(rm -r /tmp/example -f)",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assert_shell_decision(command, "deny")
+
+    def test_benign_and_quoted_rm_commands_are_allowed(self) -> None:
+        commands = (
+            "rm -r ./generated",
+            "printf '%s\\n' 'rm -rf /tmp/example'",
+            'echo "sudo rm -rf /tmp/example"',
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assert_shell_decision(command, "allow")
+
+    def test_recursive_forced_delete_in_command_substitution_is_denied(self) -> None:
+        for command in (
+            'echo "$(rm -rf /tmp/example)"',
+            'echo "$( (true); rm -rf /tmp/example)"',
+            "echo `rm -rf /tmp/example`",
+        ):
+            with self.subTest(command=command):
+                self.assert_shell_decision(command, "deny")
 
     def test_command_examples_inside_a_patch_are_not_treated_as_shell_calls(self) -> None:
         result = self.run_hook(
