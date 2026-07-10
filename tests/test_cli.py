@@ -52,6 +52,17 @@ class PortableHookCliTests(unittest.TestCase):
                 "Blocked destructive command: rm -rf",
             )
 
+    def run_codex_patch(self, patch: str) -> subprocess.CompletedProcess[str]:
+        return self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(ROOT),
+                "tool_name": "apply_patch",
+                "tool_input": {"command": patch},
+            },
+            adapter="codex",
+        )
+
     def test_dangerous_shell_command_is_denied(self) -> None:
         result = self.run_hook(
             {
@@ -425,21 +436,11 @@ class PortableHookCliTests(unittest.TestCase):
         )
 
     def test_codex_apply_patch_paths_are_checked(self) -> None:
-        result = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "cwd": str(ROOT),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": (
-                        "*** Begin Patch\n"
-                        "*** Update File: .env.production\n"
-                        "@@\n-old\n+new\n"
-                        "*** End Patch"
-                    )
-                },
-            },
-            adapter="codex",
+        result = self.run_codex_patch(
+            "*** Begin Patch\n"
+            "*** Update File: .env.production\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
         )
 
         self.assertEqual(result.returncode, 0)
@@ -464,24 +465,14 @@ class PortableHookCliTests(unittest.TestCase):
 
         for destination in destinations:
             with self.subTest(destination=destination):
-                result = self.run_hook(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "cwd": str(ROOT),
-                        "tool_name": "apply_patch",
-                        "tool_input": {
-                            "command": (
-                                "*** Begin Patch\n"
-                                "*** Update File: notes.txt\n"
-                                f"*** Move to: {destination}\n"
-                                "@@\n"
-                                "-old\n"
-                                "+new\n"
-                                "*** End Patch"
-                            )
-                        },
-                    },
-                    adapter="codex",
+                result = self.run_codex_patch(
+                    "*** Begin Patch\n"
+                    "*** Update File: notes.txt\n"
+                    f"*** Move to: {destination}\n"
+                    "@@\n"
+                    "-old\n"
+                    "+new\n"
+                    "*** End Patch"
                 )
 
                 self.assertEqual(result.returncode, 0)
@@ -497,24 +488,14 @@ class PortableHookCliTests(unittest.TestCase):
                 )
 
     def test_codex_apply_patch_allows_ordinary_move_destination(self) -> None:
-        result = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "cwd": str(ROOT),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": (
-                        "*** Begin Patch\n"
-                        "*** Update File: notes.txt\n"
-                        "*** Move to: docs/notes.txt\n"
-                        "@@\n"
-                        "-old\n"
-                        "+new\n"
-                        "*** End Patch"
-                    )
-                },
-            },
-            adapter="codex",
+        result = self.run_codex_patch(
+            "*** Begin Patch\n"
+            "*** Update File: notes.txt\n"
+            "*** Move to: docs/notes.txt\n"
+            "@@\n"
+            "-old\n"
+            "+new\n"
+            "*** End Patch"
         )
 
         self.assertEqual(result.returncode, 0)
