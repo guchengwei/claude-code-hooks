@@ -454,6 +454,72 @@ class PortableHookCliTests(unittest.TestCase):
             },
         )
 
+    def test_codex_apply_patch_move_destinations_are_checked(self) -> None:
+        destinations = (
+            ".env.production",
+            "deploy.key",
+            ".git/config",
+            "secrets/service-token.json",
+        )
+
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(ROOT),
+                        "tool_name": "apply_patch",
+                        "tool_input": {
+                            "command": (
+                                "*** Begin Patch\n"
+                                "*** Update File: notes.txt\n"
+                                f"*** Move to: {destination}\n"
+                                "@@\n"
+                                "-old\n"
+                                "+new\n"
+                                "*** End Patch"
+                            )
+                        },
+                    },
+                    adapter="codex",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(
+                    json.loads(result.stdout)["hookSpecificOutput"],
+                    {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Blocked protected path: {destination}"
+                        ),
+                    },
+                )
+
+    def test_codex_apply_patch_allows_ordinary_move_destination(self) -> None:
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(ROOT),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": (
+                        "*** Begin Patch\n"
+                        "*** Update File: notes.txt\n"
+                        "*** Move to: docs/notes.txt\n"
+                        "@@\n"
+                        "-old\n"
+                        "+new\n"
+                        "*** End Patch"
+                    )
+                },
+            },
+            adapter="codex",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+
     def test_quality_commands_do_not_run_after_read_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)

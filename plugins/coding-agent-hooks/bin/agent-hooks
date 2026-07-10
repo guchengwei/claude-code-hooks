@@ -141,7 +141,7 @@ ADAPTERS = {
 }
 
 PATCH_FILE_PATTERN = re.compile(
-    r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE
+    r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
 )
 
 DEFAULT_PROTECTED_PATHS = (
