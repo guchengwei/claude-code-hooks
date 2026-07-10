@@ -104,6 +104,7 @@ WRITE_TOOL_NAMES = {
 SHELL_TOOL_NAMES = {
     "bash",
     "execute",
+    "monitor",
     "powershell",
     "run_command",
     "run_in_terminal",
@@ -231,9 +232,18 @@ def load_config(
     path: Path | None, cwd: str | None
 ) -> tuple[dict[str, Any], str | None]:
     if path is None and cwd:
-        discovered = Path(cwd) / ".agent-hooks.json"
-        if discovered.is_file():
-            path = discovered
+        working_directory = Path(cwd).resolve()
+        repository_root = next(
+            (
+                directory
+                for directory in (working_directory, *working_directory.parents)
+                if (directory / ".git").exists()
+            ),
+            working_directory,
+        )
+        discovered_config = repository_root / ".agent-hooks.json"
+        if discovered_config.is_file():
+            path = discovered_config
     if path is None:
         return {}, None
     try:

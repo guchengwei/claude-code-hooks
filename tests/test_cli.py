@@ -53,31 +53,33 @@ class PortableHookCliTests(unittest.TestCase):
         )
         self.assertEqual(result.stderr, "")
 
-    def test_claude_payload_is_normalized_and_denied(self) -> None:
-        result = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "cwd": str(ROOT),
-                "tool_name": "Bash",
-                "tool_input": {"command": "git reset --hard HEAD~1"},
-            },
-            adapter="claude",
-        )
+    def test_claude_shell_commands_are_normalized_and_denied(self) -> None:
+        for tool_name in ("Bash", "Monitor"):
+            with self.subTest(tool_name=tool_name):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(ROOT),
+                        "tool_name": tool_name,
+                        "tool_input": {"command": "git reset --hard HEAD~1"},
+                    },
+                    adapter="claude",
+                )
 
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        "Blocked destructive command: git reset --hard"
-                    ),
-                }
-            },
-        )
-        self.assertEqual(result.stderr, "")
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(
+                    json.loads(result.stdout),
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": (
+                                "Blocked destructive command: git reset --hard"
+                            ),
+                        }
+                    },
+                )
+                self.assertEqual(result.stderr, "")
 
     def test_codex_uses_the_shared_hook_contract(self) -> None:
         result = self.run_hook(
@@ -311,6 +313,43 @@ class PortableHookCliTests(unittest.TestCase):
                     "schema": "agent-hooks/v1",
                     "event": "before_tool",
                     "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "write",
+                        "file": "operations/deploy-token.json",
+                    },
+                }
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(
+            json.loads(result.stdout)["message"],
+            "Blocked protected path: operations/deploy-token.json",
+        )
+
+    def test_repository_config_is_discovered_from_nested_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / ".git").mkdir()
+            nested_directory = project / "packages" / "service"
+            nested_directory.mkdir(parents=True)
+            (project / ".agent-hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "safety": {
+                            "additional_protected_paths": ["operations/**"]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(nested_directory),
                     "agent": "test",
                     "tool": {
                         "name": "write",

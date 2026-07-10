@@ -1,5 +1,4 @@
 {
-  "description": "Portable coding-agent safety and quality hooks",
   "hooks": {
     "PreToolUse": [
       {

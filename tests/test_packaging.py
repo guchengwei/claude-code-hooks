@@ -66,6 +66,8 @@ class PackagingTests(unittest.TestCase):
         )
         self.assertEqual(entry["category"], "Productivity")
         self.assertTrue((PLUGIN / "hooks" / "hooks.json").is_file())
+        hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
+        self.assertEqual(set(hooks), {"hooks"})
 
     def test_gemini_extension_calls_the_shared_runtime(self) -> None:
         manifest = json.loads((ROOT / "gemini-extension.json").read_text())
