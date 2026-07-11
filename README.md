@@ -1,83 +1,148 @@
-# Claude Code Hooks Starter Kit
+# Coding Agent Hooks
 
-Drop-in hooks for Claude Code that enforce code quality, block dangerous commands, and automate common tasks. Works with Node.js, Python, Go, and Rust projects.
+Portable safety policies and opt-in quality automation for coding agents.
 
-## Prerequisites
+The project uses one policy runtime with thin adapters for each agent. Claude Code, Codex, and VS Code share a plugin package; Gemini CLI uses the same runtime through its extension hook format.
 
-- **bash** 4+
-- **jq** — required for `--global` installs and settings merging (`apt install jq` / `brew install jq`)
+## Supported agents
 
-## Quick Start
+| Agent | Packaging | Status |
+| --- | --- | --- |
+| Claude Code | Plugin marketplace | Supported |
+| Codex | Plugin marketplace | Supported |
+| VS Code agents / Copilot | Claude-compatible agent plugin | Supported preview |
+| Gemini CLI | Gemini extension | Supported |
+| Other agents | Canonical JSON command interface | Adapter-ready |
 
-```bash
-# Clone this repo (fork first if you want to customize hooks)
-git clone https://github.com/guchengwei/claude-code-hooks ~/claude-code-hooks
+The runtime currently requires Python 3.10+ and a POSIX-compatible environment such as macOS, Linux, WSL, or Git Bash.
 
-# Install into your project — run from inside your project, not from this repo
-cd /path/to/your-project
-~/claude-code-hooks/install.sh .
+## Install
 
-# Or install globally (applies to all projects; requires jq)
-~/claude-code-hooks/install.sh --global
+### Claude Code
 
-# Start Claude Code
-claude
+```text
+/plugin marketplace add guchengwei/claude-code-hooks
+/plugin install coding-agent-hooks@coding-agent-hooks
 ```
 
-> **Note:** Do not open the `claude-code-hooks` directory itself in Claude Code. Run `install.sh` from your target project directory.
+Claude Code copies the plugin into its cache and keeps marketplace installations updateable. See the [Claude Code marketplace documentation](https://code.claude.com/docs/en/plugin-marketplaces).
 
-## What's Included
+### Codex
 
-| Hook                      | Type                     | What It Does                                                                           |
-| ------------------------- | ------------------------ | -------------------------------------------------------------------------------------- |
-| `block-dangerous.sh`      | PreToolUse (Bash)        | Blocks `rm -rf`, `git reset --hard`, `git push --force`, `DROP TABLE`, piped curl/wget |
-| `protect-files.sh`        | PreToolUse (Edit/Write)  | Blocks edits to `.env`, lock files, `.pem`, `.key`, `secrets/`                         |
-| `require-tests-for-pr.sh` | PreToolUse (PR creation) | Runs all test suites before allowing PR creation                                       |
-| `format-file.sh`          | PostToolUse (Write/Edit) | Auto-formats files by extension (prettier, black, gofmt, rustfmt)                      |
-| `lint-file.sh`            | PostToolUse (Write/Edit) | Auto-lints files by extension (eslint, ruff)                                           |
-| `run-tests.sh`            | PostToolUse (Write/Edit) | Runs all detected test suites after each edit                                          |
-| `log-commands.sh`         | PreToolUse (Bash)        | Logs all commands with timestamps to `.claude/command-log.txt`                         |
-| `auto-commit.sh`          | Stop                     | Auto-commits all changes when Claude stops                                             |
+```bash
+codex plugin marketplace add guchengwei/claude-code-hooks
+codex plugin add coding-agent-hooks@coding-agent-hooks
+```
 
-## Multi-Language Support
+Codex asks users to review and trust plugin hooks before running them.
 
-The installer auto-detects your project's languages and configures the right tools:
+### Gemini CLI
 
-| Language | Formatter | Linter        | Test Runner |
-| -------- | --------- | ------------- | ----------- |
-| Node.js  | prettier  | eslint        | npm test    |
-| Python   | black     | ruff          | pytest      |
-| Go       | gofmt     | golangci-lint | go test     |
-| Rust     | rustfmt   | clippy        | cargo test  |
+```bash
+gemini extensions install https://github.com/guchengwei/claude-code-hooks
+```
 
-For multi-language projects (e.g. Node + Python), all tools are configured simultaneously. Hook scripts dispatch by file extension.
+Restart Gemini CLI after installing or updating the extension.
 
-## Blank Projects
+### Local development
 
-If no language markers are found, the installer asks which languages you plan to use and sets up tools accordingly. Choose "skip" to install only safety hooks.
+```bash
+claude --plugin-dir ./plugins/coding-agent-hooks
+codex plugin marketplace add .
+gemini extensions link .
+```
 
-## Customization
+## Safe defaults
 
-### Disable a specific hook
+The installed plugin:
 
-Remove or comment out the corresponding entry in `.claude/settings.json`.
+- blocks clear destructive commands such as recursive forced deletion, `git reset --hard`, forced pushes, and piping remote downloads into a shell;
+- protects `.git/`, environment files, private keys, and `secrets/` paths;
+- allows lockfile changes;
+- does not install dependencies;
+- does not run formatters, linters, or tests unless configured;
+- does not change Git identity, stage files, commit, push, or open pull requests;
+- does not write command or transcript logs.
 
-### Add your own patterns to block-dangerous.sh
+These checks are guardrails, not a security sandbox. Keep the agent's native approval and sandbox controls enabled.
 
-Edit `.claude/hooks/block-dangerous.sh` and add patterns to the `dangerous_patterns` array.
+## Repository configuration
 
-### Add protected files
+Add `.agent-hooks.json` at the repository root to extend protected paths or opt into file-scoped quality commands:
 
-Edit `.claude/hooks/protect-files.sh` and add patterns to the `protected` array.
+```json
+{
+  "version": 1,
+  "safety": {
+    "additional_protected_paths": ["production/**"]
+  },
+  "quality": {
+    "after_write": [
+      {
+        "name": "format-python",
+        "include": ["*.py"],
+        "command": ["python3", "-m", "ruff", "format", "{file}"],
+        "timeout": 30
+      }
+    ]
+  }
+}
+```
 
-## How Hooks Work
+Quality commands are argument arrays, not shell strings. `{file}` and `{cwd}` are replaced before execution. Commands run from the event's repository working directory.
 
-- **PreToolUse**: Runs before Claude performs an action. Exit code 2 blocks the action.
-- **PostToolUse**: Runs after Claude performs an action. Used for formatting, linting, testing.
-- **Stop**: Runs when Claude finishes a task. Used for auto-committing.
+Only enable repository-defined quality commands in repositories you trust: they execute local programs with your user permissions.
 
-Configuration lives in `.claude/settings.json`. See [Claude Code Hooks Documentation](https://docs.anthropic.com/en/docs/claude-code/hooks) for details.
+## Portable interface
 
-## Credits
+Agents without a bundled adapter can send normalized JSON to the runtime:
 
-Based on [8 Claude Code Hooks That Automate What You Keep Forgetting](https://x.com/zodchiii/status/2040000216456143002) by @zodchiii.
+```bash
+printf '%s' '{
+  "schema": "agent-hooks/v1",
+  "event": "before_tool",
+  "cwd": "/path/to/project",
+  "agent": "custom-agent",
+  "tool": {"name": "shell", "command": "git status"}
+}' | plugins/coding-agent-hooks/bin/agent-hooks handle --adapter canonical
+```
+
+The canonical adapter returns:
+
+- exit `0` with `{"decision":"allow"}`; or
+- exit `2` with `{"decision":"deny","message":"..."}`.
+
+Claude Code, Codex, VS Code, and Gemini adapters translate their lifecycle payloads and decision formats at the outer seam.
+
+## Architecture
+
+```text
+agent payload
+    -> adapter normalization
+    -> canonical event
+    -> shared safety and quality policy
+    -> canonical decision
+    -> agent-specific response
+```
+
+Distribution metadata lives outside the policy implementation:
+
+- `.claude-plugin/marketplace.json` — Claude Code marketplace
+- `.agents/plugins/marketplace.json` — Codex marketplace
+- `plugins/coding-agent-hooks/` — shared Claude/Codex/VS Code plugin
+- `gemini-extension.json` and `hooks/hooks.json` — Gemini extension adapter
+
+## Migrating from `install.sh`
+
+`install.sh` is retained only as a migration notice. It no longer copies hooks into projects, merges agent settings, installs developer tools, or changes Git configuration. Install from the appropriate marketplace or extension manager instead.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests
+python3 /home/nvidia/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/coding-agent-hooks
+```
+
+## License
+
+MIT

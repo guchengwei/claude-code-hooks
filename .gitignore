@@ -1,1 +1,3 @@
-.claude/command-log.txt
+__pycache__/
+*.py[cod]
+.agent-hooks.log

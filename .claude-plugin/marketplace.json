@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "coding-agent-hooks",
+  "description": "Portable safety and quality hooks for coding agents",
+  "owner": {
+    "name": "guchengwei"
+  },
+  "plugins": [
+    {
+      "name": "coding-agent-hooks",
+      "source": "./plugins/coding-agent-hooks",
+      "description": "Shared safety policies and opt-in quality hooks for Claude Code, Codex, and VS Code",
+      "category": "Development"
+    }
+  ]
+}

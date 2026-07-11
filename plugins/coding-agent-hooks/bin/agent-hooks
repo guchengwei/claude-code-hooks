@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Portable lifecycle hook runner for coding agents."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Mapping
+
+
+SHELL_COMMAND_START = (
+    r"(?:^|[;&|(){}`\n]\s*)"
+    r"(?:(?:then|do|else)\s+)?"
+    r"(?:[A-Za-z_]\w*=[^\s;&|(){}]*\s+)*"
+    r"(?:(?:(?:sudo|doas)"
+    r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
+    r"|(?:command|exec|env|nohup|time)"
+    r"(?:\s+(?:-[^\s;&|(){}]+|[A-Za-z_]\w*=[^\s;&|(){}]+))*)\s+)*"
+)
+
+DESTRUCTIVE_COMMANDS = (
+    (
+        re.compile(
+            SHELL_COMMAND_START
+            + r"rm\b"
+            r"(?=[^;&|\n]*\s-\S*r)"
+            r"(?=[^;&|\n]*\s-\S*f)",
+            re.IGNORECASE,
+        ),
+        "rm -rf",
+    ),
+    (re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE), "git reset --hard"),
+    (
+        re.compile(
+            r"\bgit\s+push\b"
+            r"(?:(?!\s--(?=\s|[;&|]|$))[^;&|\n])*\s(?:"
+            r"--force(?:-with-lease(?:=[^\s;&|]+)?)?|-(?!-)[A-Za-z]*f[A-Za-z]*"
+            r")(?=\s|[;&|]|$)",
+            re.IGNORECASE,
+        ),
+        "git push --force",
+    ),
+    (
+        re.compile(
+            SHELL_COMMAND_START
+            + r"(?:curl|wget)\b[^\n|]*\|\s*"
+            + r"(?:(?:(?:/[A-Za-z0-9._+-]+)*/)?"
+            + r"(?:(?:sudo|doas)"
+            + r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user"
+            + r"(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
+            + r"|(?:command|exec|env|nohup|time)"
+            + r"(?:\s+(?:-[^\s;&|(){}]+|[A-Za-z_]\w*=[^\s;&|(){}]+))*"
+            + r")\s+)*"
+            + r"(?:(?:/[A-Za-z0-9._+-]+)*/)?(?:ba|z)?sh\b",
+            re.IGNORECASE,
+        ),
+        "remote script pipe",
+    ),
+)
+
+
+def shell_executable_text(command: str) -> str:
+    """Mask quoted literals but retain executable command substitutions."""
+    executable = [" "] * len(command)
+
+    def scan(index: int, terminator: str | None = None) -> int:
+        while index < len(command):
+            character = command[index]
+            if character == terminator:
+                executable[index] = character
+                return index + 1
+            if character == "'":
+                index += 1
+                while index < len(command) and command[index] != "'":
+                    index += 1
+                index += index < len(command)
+                continue
+            if character == '"':
+                index = scan_double_quote(index + 1)
+                continue
+            if character == "`":
+                executable[index] = character
+                index = scan(index + 1, "`")
+                continue
+            if command.startswith("$(", index):
+                executable[index : index + 2] = "$("
+                index = scan(index + 2, ")")
+                continue
+            if terminator == ")" and character == "(":
+                executable[index] = character
+                index = scan(index + 1, ")")
+                continue
+            executable[index] = character
+            index += 1
+        return index
+
+    def scan_double_quote(index: int) -> int:
+        while index < len(command):
+            if command[index] == '"':
+                return index + 1
+            if command[index] == "\\":
+                index += 2
+                continue
+            if command[index] == "`":
+                executable[index] = "`"
+                index = scan(index + 1, "`")
+                continue
+            if command.startswith("$(", index):
+                executable[index : index + 2] = "$("
+                index = scan(index + 2, ")")
+                continue
+            index += 1
+        return index
+
+    scan(0)
+    return "".join(executable)
+
+EVENT_NAMES = {
+    "PreToolUse": "before_tool",
+    "PostToolUse": "after_tool",
+    "Stop": "stop",
+}
+
+GEMINI_EVENT_NAMES = {
+    "BeforeTool": "before_tool",
+    "AfterTool": "after_tool",
+    "SessionEnd": "stop",
+}
+
+
+@dataclass(frozen=True)
+class AdapterSpec:
+    event_names: Mapping[str, str] | None
+    output_style: Literal["canonical", "claude", "gemini"]
+
+
+@dataclass(frozen=True)
+class HookResult:
+    decision: Literal["allow", "deny"]
+    exit_code: int = 0
+    message: str | None = None
+
+
+ADAPTERS = {
+    "canonical": AdapterSpec(None, "canonical"),
+    "claude": AdapterSpec(EVENT_NAMES, "claude"),
+    "codex": AdapterSpec(EVENT_NAMES, "claude"),
+    "vscode": AdapterSpec(EVENT_NAMES, "claude"),
+    "gemini": AdapterSpec(GEMINI_EVENT_NAMES, "gemini"),
+}
+
+PATCH_FILE_PATTERN = re.compile(
+    r"^\*\*\* ((?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
+)
+
+DEFAULT_PROTECTED_PATHS = (
+    ".git/**",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "secrets/**",
+    "**/secrets/**",
+)
+
+WRITE_TOOL_NAMES = {
+    "apply_patch",
+    "create_file",
+    "edit",
+    "editfiles",
+    "insert_edit_into_file",
+    "multiedit",
+    "multi_replace_string_in_file",
+    "notebookedit",
+    "replace",
+    "replace_string_in_file",
+    "write",
+    "write_file",
+}
+
+SHELL_TOOL_NAMES = {
+    "bash",
+    "execute",
+    "monitor",
+    "powershell",
+    "run_command",
+    "run_in_terminal",
+    "run_shell_command",
+    "runinterminal",
+    "runterminalcommand",
+    "shell",
+}
+
+VSCODE_TOOL_NAMES = {
+    "create_file",
+    "editfiles",
+    "replace_string_in_file",
+    "runterminalcommand",
+}
+
+
+def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
+    adapter_spec = ADAPTERS[adapter]
+    if adapter_spec.event_names is None:
+        return raw
+
+    tool_input = raw.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    tool_name = raw.get("tool_name") or ""
+    event_name = adapter_spec.event_names.get(
+        raw.get("hook_event_name"), "unknown"
+    )
+    files = extract_files(
+        tool_name,
+        tool_input,
+        after_tool=event_name == "after_tool",
+    )
+    return {
+        "schema": "agent-hooks/v1",
+        "event": event_name,
+        "cwd": raw.get("cwd"),
+        "agent": adapter,
+        "tool": {
+            "name": tool_name,
+            "command": tool_input.get("command"),
+            "file": files[0] if files else None,
+            "files": files,
+        },
+    }
+
+
+def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
+    if adapter != "auto":
+        return adapter
+    if os.environ.get("PLUGIN_ROOT"):
+        return "codex"
+    tool_name = str(raw.get("tool_name") or "").lower()
+    if tool_name in VSCODE_TOOL_NAMES:
+        return "vscode"
+    return "claude"
+
+
+def extract_files(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    after_tool: bool = False,
+) -> list[str]:
+    files: list[str] = []
+    direct_path = (
+        tool_input.get("file_path")
+        or tool_input.get("filePath")
+        or tool_input.get("path")
+    )
+    if isinstance(direct_path, str):
+        files.append(direct_path)
+
+    listed_paths = tool_input.get("files") or []
+    for item in listed_paths if isinstance(listed_paths, list) else []:
+        if isinstance(item, str):
+            files.append(item)
+        elif isinstance(item, dict):
+            path = item.get("file_path") or item.get("filePath") or item.get("path")
+            if isinstance(path, str):
+                files.append(path)
+
+    if tool_name.lower() == "apply_patch":
+        command = tool_input.get("command") or ""
+        patch_files = PATCH_FILE_PATTERN.findall(command)
+        if after_tool:
+            for index, (action, path) in enumerate(patch_files):
+                next_action = (
+                    patch_files[index + 1][0]
+                    if index + 1 < len(patch_files)
+                    else None
+                )
+                if action == "Delete File":
+                    continue
+                if action == "Update File" and next_action == "Move to":
+                    continue
+                files.append(path)
+        else:
+            files.extend(path for _, path in patch_files)
+
+    return list(dict.fromkeys(files))
+
+
+def require_string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise ValueError(f"{field} must be an array of strings")
+    return value
+
+
+def validate_config(config: Any) -> dict[str, Any]:
+    if not isinstance(config, dict) or config.get("version") != 1:
+        raise ValueError("config version must be 1")
+
+    safety = config.get("safety", {})
+    if not isinstance(safety, dict):
+        raise ValueError("safety must be an object")
+    require_string_list(
+        safety.get("additional_protected_paths", []),
+        "safety.additional_protected_paths",
+    )
+
+    quality = config.get("quality", {})
+    if not isinstance(quality, dict):
+        raise ValueError("quality must be an object")
+    after_write = quality.get("after_write", [])
+    if not isinstance(after_write, list):
+        raise ValueError("quality.after_write must be an array")
+    for index, hook in enumerate(after_write):
+        field = f"quality.after_write[{index}]"
+        if not isinstance(hook, dict):
+            raise ValueError(f"{field} must be an object")
+        if not isinstance(hook.get("name"), str) or not hook["name"]:
+            raise ValueError(f"{field}.name must be a non-empty string")
+        require_string_list(hook.get("include", ["*"]), f"{field}.include")
+        command = require_string_list(hook.get("command"), f"{field}.command")
+        if not command:
+            raise ValueError(f"{field}.command must not be empty")
+        timeout = hook.get("timeout", 30)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"{field}.timeout must be a positive number")
+
+    return config
+
+
+def load_config(
+    path: Path | None, cwd: str | None
+) -> tuple[dict[str, Any], str | None]:
+    if path is None and cwd:
+        working_directory = Path(cwd).resolve()
+        repository_root = next(
+            (
+                directory
+                for directory in (working_directory, *working_directory.parents)
+                if (directory / ".git").exists()
+            ),
+            working_directory,
+        )
+        discovered_config = repository_root / ".agent-hooks.json"
+        if discovered_config.is_file():
+            path = discovered_config
+    if path is None:
+        return {}, None
+    try:
+        with path.open(encoding="utf-8") as file:
+            config = validate_config(json.load(file))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return {}, f"Ignoring invalid configuration at {path}: {error}"
+    return config, None
+
+
+def path_matches(path: str, pattern: str) -> bool:
+    candidate = path.replace("\\", "/")
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    if "/" not in pattern:
+        candidate = candidate.rsplit("/", 1)[-1]
+    candidate = candidate.lower()
+    pattern = pattern.lower()
+    return fnmatch.fnmatchcase(candidate, pattern) or (
+        "/" in pattern and fnmatch.fnmatchcase(candidate, f"*/{pattern}")
+    )
+
+
+def tool_files(tool: Mapping[str, Any]) -> list[str]:
+    files = tool.get("files") or []
+    if not files and tool.get("file"):
+        files = [tool["file"]]
+    return [str(path) for path in files]
+
+
+def evaluate(
+    event: dict[str, Any], config: dict[str, Any]
+) -> HookResult:
+    if event.get("event") == "after_tool":
+        return run_quality_commands(event, config)
+    if event.get("event") != "before_tool":
+        return HookResult("allow")
+
+    tool = event.get("tool") or {}
+    command = str(tool.get("command") or "")
+    if str(tool.get("name") or "").lower() in SHELL_TOOL_NAMES:
+        command = shell_executable_text(command)
+        for pattern, label in DESTRUCTIVE_COMMANDS:
+            if pattern.search(command):
+                return HookResult(
+                    "deny",
+                    exit_code=2,
+                    message=f"Blocked destructive command: {label}",
+                )
+
+    file_paths = tool_files(tool)
+    extra_paths = config.get("safety", {}).get(
+        "additional_protected_paths", []
+    )
+    protected_paths = (*DEFAULT_PROTECTED_PATHS, *extra_paths)
+    if str(tool.get("name") or "").lower() in WRITE_TOOL_NAMES:
+        for file_path in file_paths:
+            if any(path_matches(file_path, pattern) for pattern in protected_paths):
+                return HookResult(
+                    "deny",
+                    exit_code=2,
+                    message=f"Blocked protected path: {file_path}",
+                )
+
+    return HookResult("allow")
+
+
+def run_quality_commands(
+    event: dict[str, Any], config: dict[str, Any]
+) -> HookResult:
+    tool = event.get("tool") or {}
+    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+        return HookResult("allow")
+    file_paths = tool_files(tool)
+    if not file_paths:
+        return HookResult("allow")
+
+    cwd = event.get("cwd") or "."
+    for file_path in file_paths:
+        for hook in config.get("quality", {}).get("after_write", []):
+            include = hook.get("include", ["*"])
+            if not any(path_matches(file_path, pattern) for pattern in include):
+                continue
+
+            command = [
+                str(argument).replace("{file}", file_path).replace("{cwd}", cwd)
+                for argument in hook["command"]
+            ]
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    text=True,
+                    capture_output=True,
+                    timeout=hook.get("timeout", 30),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return HookResult(
+                    "deny",
+                    exit_code=2,
+                    message=(
+                        f"Quality hook '{hook['name']}' timed out after "
+                        f"{hook.get('timeout', 30)} seconds"
+                    ),
+                )
+            except OSError as error:
+                return HookResult(
+                    "deny",
+                    exit_code=2,
+                    message=f"Quality hook '{hook['name']}' could not run: {error}",
+                )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                message = f"Quality hook '{hook['name']}' failed"
+                if detail:
+                    message = f"{message}: {detail}"
+                return HookResult("deny", exit_code=2, message=message)
+
+    return HookResult("allow")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="agent-hooks")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    handle = subparsers.add_parser("handle")
+    handle.add_argument(
+        "--adapter",
+        choices=("auto", *ADAPTERS),
+        required=True,
+    )
+    handle.add_argument("--config", type=Path)
+    return parser
+
+
+def render(
+    adapter: str,
+    event: dict[str, Any],
+    result: HookResult,
+    warning: str | None,
+) -> tuple[int, dict[str, Any]]:
+    output_style = ADAPTERS[adapter].output_style
+    if output_style == "canonical":
+        output: dict[str, Any] = {"decision": result.decision}
+        if result.message:
+            output["message"] = result.message
+        if warning:
+            output["warning"] = warning
+        return result.exit_code, output
+    if output_style == "gemini":
+        if result.decision == "deny":
+            output = {"decision": "deny", "reason": result.message}
+        else:
+            output = {}
+        if warning:
+            output["systemMessage"] = warning
+        return 0, output
+    if result.decision == "deny":
+        if event.get("event") == "after_tool":
+            output = {
+                "decision": "block",
+                "reason": result.message,
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": result.message,
+                },
+            }
+        else:
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": result.message,
+                }
+            }
+    else:
+        output = {}
+    if warning:
+        output["systemMessage"] = warning
+    return 0, output
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command != "handle":
+        return 64
+
+    raw_event = json.load(sys.stdin)
+    adapter = resolve_adapter(args.adapter, raw_event)
+    event = normalize(adapter, raw_event)
+    config, warning = load_config(args.config, event.get("cwd"))
+    result = evaluate(event, config)
+    exit_code, output = render(adapter, event, result, warning)
+    json.dump(output, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

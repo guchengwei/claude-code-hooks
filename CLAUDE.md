@@ -1,12 +1,27 @@
-# Claude Code Hooks Starter Kit
+# Coding Agent Hooks
 
-This repo contains reusable Claude Code hooks for safety, code quality, and automation.
+This repository contains a portable hook runtime with adapters for Claude Code, Codex, VS Code, and Gemini CLI.
 
 ## Hooks Overview
-- **Safety**: block-dangerous.sh, protect-files.sh
-- **Quality**: format-file.sh, lint-file.sh, run-tests.sh, require-tests-for-pr.sh
-- **Automation**: log-commands.sh, auto-commit.sh
+
+- **Safety**: shared destructive-command and protected-path policies
+- **Quality**: opt-in, repository-configured commands scoped by changed file
+- **Adapters**: agent-specific event normalization and response rendering
 
 ## Usage
-Run `./install.sh [target-dir]` to install hooks into any project.
-Run `./install.sh --global` to install hooks globally for all projects.
+
+Install the plugin or extension using the agent-native commands in `README.md`. Do not restore the legacy copy-and-merge installer.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues; external pull requests are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.

@@ -1,5 +1,7 @@
 # Requirements: Installer UX Fixes
 
+> Superseded by the marketplace-first, agent-neutral core redesign. Retained as historical context for the removed installer.
+
 **Date:** 2026-04-06  
 **Status:** Ready for planning  
 **Scope:** Standard

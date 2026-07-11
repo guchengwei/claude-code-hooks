@@ -1,0 +1,21 @@
+{
+  "name": "coding-agent-hooks",
+  "version": "0.1.0",
+  "description": "Portable safety policies and opt-in quality hooks for coding agents",
+  "author": {
+    "name": "guchengwei"
+  },
+  "homepage": "https://github.com/guchengwei/claude-code-hooks",
+  "repository": "https://github.com/guchengwei/claude-code-hooks",
+  "license": "MIT",
+  "keywords": ["hooks", "safety", "quality", "coding-agents"],
+  "interface": {
+    "displayName": "Coding Agent Hooks",
+    "shortDescription": "Portable guardrails for coding agents.",
+    "longDescription": "Shared safety policies and opt-in quality commands for Codex and other coding agents.",
+    "developerName": "guchengwei",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Show me how Coding Agent Hooks protects this repository."
+  }
+}

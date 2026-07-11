@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "safety": {
+    "additional_protected_paths": ["production/**"]
+  },
+  "quality": {
+    "after_write": [
+      {
+        "name": "format-python",
+        "include": ["*.py"],
+        "command": ["python3", "-m", "ruff", "format", "{file}"],
+        "timeout": 30
+      }
+    ]
+  }
+}

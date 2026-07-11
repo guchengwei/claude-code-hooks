@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "coding-agent-hooks",
+  "version": "0.1.0",
+  "description": "Portable safety policies and opt-in quality hooks for coding agents",
+  "author": {
+    "name": "guchengwei"
+  },
+  "homepage": "https://github.com/guchengwei/claude-code-hooks",
+  "repository": "https://github.com/guchengwei/claude-code-hooks",
+  "license": "MIT",
+  "keywords": ["hooks", "safety", "quality", "coding-agents"]
+}
