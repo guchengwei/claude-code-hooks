@@ -185,16 +185,25 @@ TRUST_STORE_ENV = "AGENT_HOOKS_TRUST_STORE"
 TRUST_STORE_VERSION = 1
 TRUST_DIGEST_FIELD = "quality_after_write_sha256"
 
+CANONICAL_EFFECTS = frozenset(
+    {"filesystem_write", "shell_execute", "read_only", "unknown"}
+)
+
+# Raw vendor tool names are intentionally confined to this adapter seam. Shared
+# policy below consumes only the normalized ``tool.effect`` value.
 WRITE_TOOL_NAMES = {
     "apply_patch",
     "create_file",
     "edit",
     "editfiles",
+    "inserteditintofile",
     "insert_edit_into_file",
     "multiedit",
+    "multireplacestringinfile",
     "multi_replace_string_in_file",
     "notebookedit",
     "replace",
+    "replacestringinfile",
     "replace_string_in_file",
     "write",
     "write_file",
@@ -203,6 +212,7 @@ WRITE_TOOL_NAMES = {
 SHELL_TOOL_NAMES = {
     "bash",
     "execute",
+    "exec_command",
     "monitor",
     "powershell",
     "run_command",
@@ -211,6 +221,23 @@ SHELL_TOOL_NAMES = {
     "runinterminal",
     "runterminalcommand",
     "shell",
+}
+
+READ_TOOL_NAMES = {
+    "glob",
+    "grep",
+    "list_directory",
+    "listdirectory",
+    "ls",
+    "read",
+    "read_file",
+    "readfile",
+    "read_many_files",
+    "readmanyfiles",
+    "search_file_content",
+    "searchfilecontent",
+    "webfetch",
+    "websearch",
 }
 
 VSCODE_TOOL_NAMES = {
@@ -224,7 +251,14 @@ VSCODE_TOOL_NAMES = {
 def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
     adapter_spec = ADAPTERS[adapter]
     if adapter_spec.event_names is None:
-        return raw
+        event = dict(raw)
+        raw_tool = raw.get("tool") or {}
+        tool = dict(raw_tool) if isinstance(raw_tool, dict) else {}
+        effects = classify_effects(tool)
+        tool["effect"] = effects[0]
+        tool["effects"] = list(effects)
+        event["tool"] = tool
+        return event
 
     tool_input = raw.get("tool_input") or {}
     if not isinstance(tool_input, dict):
@@ -238,18 +272,68 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
         tool_input,
         after_tool=event_name == "after_tool",
     )
+    normalized_tool = {
+        "name": tool_name,
+        "command": tool_input.get("command"),
+        "file": files[0] if files else None,
+        "files": files,
+    }
+    effects = classify_effects(normalized_tool)
+    normalized_tool["effect"] = effects[0]
+    normalized_tool["effects"] = list(effects)
     return {
         "schema": "agent-hooks/v1",
         "event": event_name,
         "cwd": raw.get("cwd"),
         "agent": adapter,
-        "tool": {
-            "name": tool_name,
-            "command": tool_input.get("command"),
-            "file": files[0] if files else None,
-            "files": files,
-        },
+        "tool": normalized_tool,
     }
+
+
+def classify_effect(tool: Mapping[str, Any]) -> str:
+    """Return the stable policy effect for an adapter or canonical tool."""
+    return classify_effects(tool)[0]
+
+
+def classify_effects(tool: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return every policy effect implied by a normalized tool payload.
+
+    The first item is the backwards-compatible primary effect. Unknown tool
+    payloads may imply both command execution and filesystem mutation; keeping
+    both prevents either policy family from being skipped.
+    """
+    explicit_effect = tool.get("effect")
+    if (
+        isinstance(explicit_effect, str)
+        and explicit_effect in CANONICAL_EFFECTS
+        and explicit_effect != "unknown"
+    ):
+        return (explicit_effect,)
+
+    tool_name = str(tool.get("name") or "").lower()
+    if tool_name in WRITE_TOOL_NAMES:
+        return ("filesystem_write",)
+    if tool_name in SHELL_TOOL_NAMES:
+        return ("shell_execute",)
+    if tool_name in READ_TOOL_NAMES:
+        return ("read_only",)
+
+    # Payload-shape fallback prevents new/unknown vendor aliases from bypassing
+    # destructive-command or protected-path checks. A known read alias was
+    # already returned above, so its file target remains readable.
+    effects = []
+    if tool.get("command") is not None:
+        effects.append("shell_execute")
+    if tool_files(tool):
+        effects.append("filesystem_write")
+    return tuple(effects) or ("unknown",)
+
+
+def tool_has_effect(tool: Mapping[str, Any], effect: str) -> bool:
+    effects = tool.get("effects")
+    if isinstance(effects, list):
+        return effect in effects
+    return tool.get("effect") == effect
 
 
 def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
@@ -548,7 +632,7 @@ def evaluate(
 
     tool = event.get("tool") or {}
     command = str(tool.get("command") or "")
-    if str(tool.get("name") or "").lower() in SHELL_TOOL_NAMES:
+    if tool_has_effect(tool, "shell_execute"):
         command = shell_executable_text(command)
         for pattern, label in DESTRUCTIVE_COMMANDS:
             if pattern.search(command):
@@ -563,7 +647,7 @@ def evaluate(
         "additional_protected_paths", []
     )
     protected_paths = (*DEFAULT_PROTECTED_PATHS, *extra_paths)
-    if str(tool.get("name") or "").lower() in WRITE_TOOL_NAMES:
+    if tool_has_effect(tool, "filesystem_write"):
         for file_path in file_paths:
             if any(path_matches(file_path, pattern) for pattern in protected_paths):
                 return HookResult(
@@ -581,7 +665,7 @@ def quality_commands_applicable(
     if event.get("event") != "after_tool":
         return False
     tool = event.get("tool") or {}
-    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+    if not tool_has_effect(tool, "filesystem_write"):
         return False
     file_paths = tool_files(tool)
     for file_path in file_paths:
@@ -598,7 +682,7 @@ def run_quality_commands(
     event: dict[str, Any], config: dict[str, Any]
 ) -> HookResult:
     tool = event.get("tool") or {}
-    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+    if not tool_has_effect(tool, "filesystem_write"):
         return HookResult("allow")
     file_paths = tool_files(tool)
     if not file_paths:

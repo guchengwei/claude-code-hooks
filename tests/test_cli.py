@@ -1612,6 +1612,410 @@ class PortableHookCliTests(unittest.TestCase):
             "deny",
         )
 
+    def test_write_aliases_are_normalized_across_adapters(self) -> None:
+        cases = (
+            (
+                "claude",
+                "MultiEdit",
+                {"file_path": ".env.production", "edits": []},
+            ),
+            (
+                "codex",
+                "apply_patch",
+                {
+                    "command": (
+                        "*** Begin Patch\n*** Update File: .env.production\n"
+                        "@@\n-old\n+new\n*** End Patch"
+                    )
+                },
+            ),
+            ("vscode", "editFiles", {"files": [{"filePath": ".env.production"}]}),
+            ("gemini", "write_file", {"file_path": ".env.production"}),
+        )
+
+        for adapter, tool_name, tool_input in cases:
+            with self.subTest(adapter=adapter, tool_name=tool_name):
+                event_name = "BeforeTool" if adapter == "gemini" else "PreToolUse"
+                result = self.run_hook(
+                    {
+                        "hook_event_name": event_name,
+                        "cwd": str(ROOT),
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                    },
+                    adapter=adapter,
+                )
+                output = json.loads(result.stdout)
+                rendered = json.dumps(output)
+                self.assertIn("Blocked protected path: .env.production", rendered)
+
+    def test_shell_aliases_are_normalized_across_adapters(self) -> None:
+        cases = (
+            ("claude", "Monitor"),
+            ("codex", "exec_command"),
+            ("vscode", "runTerminalCommand"),
+            ("gemini", "run_shell_command"),
+        )
+
+        for adapter, tool_name in cases:
+            with self.subTest(adapter=adapter, tool_name=tool_name):
+                event_name = "BeforeTool" if adapter == "gemini" else "PreToolUse"
+                result = self.run_hook(
+                    {
+                        "hook_event_name": event_name,
+                        "cwd": str(ROOT),
+                        "tool_name": tool_name,
+                        "tool_input": {"command": "git reset --hard HEAD"},
+                    },
+                    adapter=adapter,
+                )
+                self.assertIn(
+                    "Blocked destructive command: git reset --hard",
+                    json.dumps(json.loads(result.stdout)),
+                )
+
+    def test_claude_ls_alias_can_list_protected_paths(self) -> None:
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(ROOT),
+                "tool_name": "LS",
+                "tool_input": {"path": ".git"},
+            },
+            adapter="claude",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
+
+    def test_explicit_effect_drives_policy_instead_of_raw_name(self) -> None:
+        write_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "Read",
+                    "effect": "filesystem_write",
+                    "file": ".env",
+                },
+            }
+        )
+        read_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "write",
+                    "effect": "read_only",
+                    "file": ".env",
+                },
+            }
+        )
+
+        self.assertEqual(write_result.returncode, 2)
+        self.assertEqual(
+            json.loads(write_result.stdout)["message"],
+            "Blocked protected path: .env",
+        )
+        self.assertEqual(read_result.returncode, 0)
+        self.assertEqual(json.loads(read_result.stdout), {"decision": "allow"})
+
+    def test_explicit_filesystem_effect_runs_quality_for_unknown_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / "agent-hooks.json"
+            self.write_quality_config(
+                config,
+                "from pathlib import Path; Path('ran').touch()",
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment, config=config)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "future_vendor_mutator",
+                        "effect": "filesystem_write",
+                        "file": "src/app.py",
+                    },
+                },
+                config=config,
+                environment=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((project / "ran").exists())
+
+    def test_untrusted_quality_warning_is_driven_by_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / "agent-hooks.json"
+            self.write_quality_config(
+                config,
+                "from pathlib import Path; Path('ran').touch()",
+            )
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "Read",
+                        "effect": "filesystem_write",
+                        "file": "src/app.py",
+                    },
+                },
+                config=config,
+                environment=self.trust_environment(base),
+            )
+
+            self.assertFalse((project / "ran").exists())
+
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "allow")
+        self.assertIn("Skipped untrusted repository quality commands", output["warning"])
+
+    def test_unknown_payload_shapes_fail_safe_without_blocking_pings(self) -> None:
+        command_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "future_terminal",
+                    "command": "rm -rf ./generated",
+                },
+            }
+        )
+        file_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {"name": "future_mutator", "files": [".env"]},
+            }
+        )
+        ping_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {"name": "mcp__example__ping", "arguments": {}},
+            }
+        )
+
+        self.assertEqual(command_result.returncode, 2)
+        self.assertIn("rm -rf", json.loads(command_result.stdout)["message"])
+        self.assertEqual(file_result.returncode, 2)
+        self.assertIn(".env", json.loads(file_result.stdout)["message"])
+        self.assertEqual(ping_result.returncode, 0)
+        self.assertEqual(json.loads(ping_result.stdout), {"decision": "allow"})
+
+    def test_explicit_unknown_effect_cannot_suppress_payload_fallback(self) -> None:
+        command_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "future_terminal",
+                    "effect": "unknown",
+                    "command": "git reset --hard HEAD",
+                },
+            }
+        )
+        file_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "future_mutator",
+                    "effect": "unknown",
+                    "files": [".env"],
+                },
+            }
+        )
+        ping_result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "mcp__example__ping",
+                    "effect": "unknown",
+                    "arguments": {},
+                },
+            }
+        )
+
+        self.assertEqual(command_result.returncode, 2)
+        self.assertEqual(
+            json.loads(command_result.stdout)["message"],
+            "Blocked destructive command: git reset --hard",
+        )
+        self.assertEqual(file_result.returncode, 2)
+        self.assertEqual(
+            json.loads(file_result.stdout)["message"],
+            "Blocked protected path: .env",
+        )
+        self.assertEqual(ping_result.returncode, 0)
+        self.assertEqual(json.loads(ping_result.stdout), {"decision": "allow"})
+
+    def test_unknown_combined_payload_enforces_shell_and_file_policies(self) -> None:
+        destructive = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "future_combined_tool",
+                    "effect": "unknown",
+                    "command": "git reset --hard HEAD",
+                    "files": ["src/app.py"],
+                },
+            }
+        )
+        protected = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {
+                    "name": "future_combined_tool",
+                    "effect": "unknown",
+                    "command": "printf safe",
+                    "files": [".env"],
+                },
+            }
+        )
+
+        self.assertEqual(destructive.returncode, 2)
+        self.assertIn("git reset --hard", json.loads(destructive.stdout)["message"])
+        self.assertEqual(protected.returncode, 2)
+        self.assertEqual(
+            json.loads(protected.stdout)["message"], "Blocked protected path: .env"
+        )
+
+    def test_adapter_unknown_combined_payload_enforces_file_policy(self) -> None:
+        for adapter in ("claude", "gemini", "vscode"):
+            with self.subTest(adapter=adapter):
+                event_name = "BeforeTool" if adapter == "gemini" else "PreToolUse"
+                result = self.run_hook(
+                    {
+                        "hook_event_name": event_name,
+                        "cwd": str(ROOT),
+                        "tool_name": "future_combined_tool",
+                        "tool_input": {
+                            "command": "printf safe",
+                            "file_path": ".env",
+                        },
+                    },
+                    adapter=adapter,
+                )
+                self.assertIn(
+                    "Blocked protected path: .env",
+                    json.dumps(json.loads(result.stdout)),
+                )
+
+    def test_unknown_combined_payload_runs_after_write_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / "agent-hooks.json"
+            self.write_quality_config(
+                config, "from pathlib import Path; Path('ran').touch()"
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment, config=config)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "future_combined_tool",
+                        "effect": "unknown",
+                        "command": "printf safe",
+                        "files": ["src/app.py"],
+                    },
+                },
+                config=config,
+                environment=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((project / "ran").exists())
+
+    def test_invalid_explicit_effect_falls_back_to_payload_classification(self) -> None:
+        for invalid_effect in ("safe-ish", ["shell_execute"]):
+            with self.subTest(effect=invalid_effect):
+                command_result = self.run_hook(
+                    {
+                        "schema": "agent-hooks/v1",
+                        "event": "before_tool",
+                        "cwd": str(ROOT),
+                        "agent": "test",
+                        "tool": {
+                            "name": "future_terminal",
+                            "effect": invalid_effect,
+                            "command": "git reset --hard HEAD",
+                            "files": ["src/app.py"],
+                        },
+                    }
+                )
+                file_result = self.run_hook(
+                    {
+                        "schema": "agent-hooks/v1",
+                        "event": "before_tool",
+                        "cwd": str(ROOT),
+                        "agent": "test",
+                        "tool": {
+                            "name": "future_combined_tool",
+                            "effect": invalid_effect,
+                            "command": "printf safe",
+                            "files": [".env"],
+                        },
+                    }
+                )
+
+                self.assertEqual(command_result.returncode, 2)
+                self.assertEqual(
+                    json.loads(command_result.stdout)["message"],
+                    "Blocked destructive command: git reset --hard",
+                )
+                self.assertEqual(file_result.returncode, 2)
+                self.assertEqual(
+                    json.loads(file_result.stdout)["message"],
+                    "Blocked protected path: .env",
+                )
+
     def test_missing_quality_command_is_reported_without_a_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

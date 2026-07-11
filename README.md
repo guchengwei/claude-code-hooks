@@ -150,9 +150,31 @@ printf '%s' '{
   "event": "before_tool",
   "cwd": "/path/to/project",
   "agent": "custom-agent",
-  "tool": {"name": "shell", "command": "git status"}
+  "tool": {
+    "name": "shell",
+    "effect": "shell_execute",
+    "command": "git status"
+  }
 }' | plugins/coding-agent-hooks/bin/agent-hooks handle --adapter canonical
 ```
+
+`tool.effect` is the stable shared-policy contract. Its valid values are:
+
+- `filesystem_write` — a tool that creates, edits, moves, or deletes files;
+- `shell_execute` — a tool that executes or monitors a shell command;
+- `read_only` — a known non-mutating read or search tool;
+- `unknown` — a tool without a recognized side effect.
+
+Bundled adapters classify their platform-specific tool aliases at the outer
+seam, before shared policy evaluation. Canonical callers should supply an
+explicit effect. For backward compatibility, a missing or invalid effect is
+classified from a known tool name and then from payload shape. An explicit
+`unknown` also uses this fallback when the payload contains side-effect evidence:
+an unknown tool with `command` is treated as `shell_execute`, while one with
+`file` or `files` is treated as `filesystem_write`. Known read-only tools may
+still read protected paths. Unknown tools without a command or file target remain
+`unknown` and are allowed, so unrelated lifecycle events and MCP pings are not
+blanket-blocked.
 
 The canonical adapter returns:
 
