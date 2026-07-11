@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from typing import Any, Literal, Mapping
 SHELL_COMMAND_START = (
     r"(?:^|[;&|(){}`\n]\s*)"
     r"(?:(?:then|do|else)\s+)?"
+    r"(?:[A-Za-z_]\w*=[^\s;&|(){}]*\s+)*"
     r"(?:(?:(?:sudo|doas)"
     r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
     r"|(?:command|exec|env|nohup|time)"
@@ -229,6 +231,7 @@ READ_TOOL_NAMES = {
     "grep",
     "list_directory",
     "listdirectory",
+    "ls",
     "read",
     "read_file",
     "readfile",
@@ -254,7 +257,9 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
         event = dict(raw)
         raw_tool = raw.get("tool") or {}
         tool = dict(raw_tool) if isinstance(raw_tool, dict) else {}
-        tool["effect"] = classify_effect(tool)
+        effects = classify_effects(tool)
+        tool["effect"] = effects[0]
+        tool["effects"] = list(effects)
         event["tool"] = tool
         return event
 
@@ -271,57 +276,71 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
         after_tool=event_name == "after_tool",
     )
     boundary_files = extract_files(tool_name, tool_input, after_tool=False)
+    normalized_tool = {
+        "name": tool_name,
+        "command": tool_input.get("command"),
+        "file": files[0] if files else None,
+        "files": files,
+    }
+    effects = classify_effects(normalized_tool)
+    normalized_tool["effect"] = effects[0]
+    normalized_tool["effects"] = list(effects)
+    # Post-tool quality targets intentionally omit deleted and obsolete move
+    # sources. Boundary targets retain every reported patch path.
+    normalized_tool["boundary_files"] = boundary_files
     return {
         "schema": "agent-hooks/v1",
         "event": event_name,
         "cwd": raw.get("cwd"),
         "agent": adapter,
-        "tool": {
-            "name": tool_name,
-            "effect": classify_effect(
-                {
-                    "name": tool_name,
-                    "command": tool_input.get("command"),
-                    "files": files,
-                }
-            ),
-            "command": tool_input.get("command"),
-            "file": files[0] if files else None,
-            "files": files,
-            # Post-tool quality targets intentionally omit deleted and obsolete
-            # move-source paths. Boundary targets retain every reported path so
-            # workspace verification remains independent from quality policy.
-            "boundary_files": boundary_files,
-        },
+        "tool": normalized_tool,
     }
 
 
 def classify_effect(tool: Mapping[str, Any]) -> str:
     """Return the stable policy effect for an adapter or canonical tool."""
+    return classify_effects(tool)[0]
+
+
+def classify_effects(tool: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return every policy effect implied by a normalized tool payload.
+
+    The first item is the backwards-compatible primary effect. Unknown tool
+    payloads may imply both command execution and filesystem mutation; keeping
+    both prevents either policy family from being skipped.
+    """
     explicit_effect = tool.get("effect")
     if (
         isinstance(explicit_effect, str)
         and explicit_effect in CANONICAL_EFFECTS
         and explicit_effect != "unknown"
     ):
-        return explicit_effect
+        return (explicit_effect,)
 
     tool_name = str(tool.get("name") or "").lower()
     if tool_name in WRITE_TOOL_NAMES:
-        return "filesystem_write"
+        return ("filesystem_write",)
     if tool_name in SHELL_TOOL_NAMES:
-        return "shell_execute"
+        return ("shell_execute",)
     if tool_name in READ_TOOL_NAMES:
-        return "read_only"
+        return ("read_only",)
 
     # Payload-shape fallback prevents new/unknown vendor aliases from bypassing
     # destructive-command or protected-path checks. A known read alias was
     # already returned above, so its file target remains readable.
+    effects = []
     if tool.get("command") is not None:
-        return "shell_execute"
+        effects.append("shell_execute")
     if tool_files(tool):
-        return "filesystem_write"
-    return "unknown"
+        effects.append("filesystem_write")
+    return tuple(effects) or ("unknown",)
+
+
+def tool_has_effect(tool: Mapping[str, Any], effect: str) -> bool:
+    effects = tool.get("effects")
+    if isinstance(effects, list):
+        return effect in effects
+    return tool.get("effect") == effect
 
 
 def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
@@ -678,7 +697,11 @@ def resolve_workspace_target(
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             candidate = working_directory / candidate
-        target = candidate.resolve(strict=False)
+        # Do not rely on Path.resolve() to reject symlink loops: its
+        # strict=False behaviour differs across supported Python/platform
+        # combinations.  Walk links explicitly and fail closed on a repeated
+        # link (or an excessive chain), including links in parent components.
+        target = resolve_links_fail_closed(candidate)
     except (OSError, RuntimeError, ValueError) as error:
         return None, f"Could not safely resolve write target {raw_path!r}: {error}"
     if not path_is_within(target, root):
@@ -688,11 +711,42 @@ def resolve_workspace_target(
     return target, None
 
 
+def resolve_links_fail_closed(path: Path) -> Path:
+    """Resolve existing symlinks while explicitly rejecting link cycles."""
+    candidate = Path(os.path.abspath(path))
+    followed: set[Path] = set()
+    for _ in range(41):
+        current = Path(candidate.anchor)
+        replaced = False
+        for component in candidate.parts[1:]:
+            current /= component
+            try:
+                is_link = stat.S_ISLNK(os.lstat(current).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                is_link = False
+            if not is_link:
+                continue
+            link = Path(os.path.abspath(current))
+            if link in followed or len(followed) >= 40:
+                raise RuntimeError(f"symlink resolution loop at {link}")
+            followed.add(link)
+            destination = Path(os.readlink(current))
+            if not destination.is_absolute():
+                destination = current.parent / destination
+            remainder = candidate.parts[len(current.parts) :]
+            candidate = Path(os.path.abspath(destination.joinpath(*remainder)))
+            replaced = True
+            break
+        if not replaced:
+            return candidate
+    raise RuntimeError(f"too many symlinks while resolving {path}")
+
+
 def workspace_boundary_result(
     event: Mapping[str, Any], workspace_root: Path
 ) -> HookResult | None:
     tool = event.get("tool") or {}
-    if tool.get("effect") != "filesystem_write":
+    if not tool_has_effect(tool, "filesystem_write"):
         return None
     files = boundary_tool_files(tool)
     if not files:
@@ -756,9 +810,9 @@ def evaluate(
 
     strict, strict_error = strict_workspace_enabled(config)
     tool = event.get("tool") or {}
-    if tool.get("effect") == "filesystem_write" and strict_error:
+    if tool_has_effect(tool, "filesystem_write") and strict_error:
         return HookResult("deny", exit_code=2, message=strict_error)
-    if tool.get("effect") == "filesystem_write" and strict:
+    if tool_has_effect(tool, "filesystem_write") and strict:
         problem = strict_context_problem(event.get("cwd"))
         if problem:
             return HookResult(
@@ -772,18 +826,18 @@ def evaluate(
         "is invalid or unreadable"
     )
     if event.get("event") == "after_tool":
-        if tool.get("effect") == "filesystem_write" and not config_valid:
+        if tool_has_effect(tool, "filesystem_write") and not config_valid:
             return HookResult("deny", exit_code=2, message=config_error)
         if not quality_trusted:
             return HookResult("allow")
         return run_quality_commands(event, config)
     if event.get("event") != "before_tool":
-        if tool.get("effect") == "filesystem_write" and not config_valid:
+        if tool_has_effect(tool, "filesystem_write") and not config_valid:
             return HookResult("deny", exit_code=2, message=config_error)
         return HookResult("allow")
 
     command = str(tool.get("command") or "")
-    if tool.get("effect") == "shell_execute":
+    if tool_has_effect(tool, "shell_execute"):
         command = shell_executable_text(command)
         for pattern, label in DESTRUCTIVE_COMMANDS:
             if pattern.search(command):
@@ -798,7 +852,7 @@ def evaluate(
         "additional_protected_paths", []
     )
     protected_paths = (*DEFAULT_PROTECTED_PATHS, *extra_paths)
-    if tool.get("effect") == "filesystem_write":
+    if tool_has_effect(tool, "filesystem_write"):
         for file_path in file_paths:
             if any(path_matches(file_path, pattern) for pattern in protected_paths):
                 return HookResult(
@@ -818,7 +872,7 @@ def quality_commands_applicable(
     if event.get("event") != "after_tool":
         return False
     tool = event.get("tool") or {}
-    if tool.get("effect") != "filesystem_write":
+    if not tool_has_effect(tool, "filesystem_write"):
         return False
     file_paths = tool_files(tool)
     for file_path in file_paths:
@@ -835,7 +889,7 @@ def run_quality_commands(
     event: dict[str, Any], config: dict[str, Any]
 ) -> HookResult:
     tool = event.get("tool") or {}
-    if tool.get("effect") != "filesystem_write":
+    if not tool_has_effect(tool, "filesystem_write"):
         return HookResult("allow")
     file_paths = tool_files(tool)
     if not file_paths:
