@@ -124,6 +124,39 @@ class PortableHookCliTests(unittest.TestCase):
             adapter="codex",
         )
 
+    def write_path_recording_quality_config(self, project: Path) -> Path:
+        config = project / "agent-hooks.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "quality": {
+                        "after_write": [
+                            {
+                                "name": "record-existing-python-path",
+                                "include": ["*.py"],
+                                "command": [
+                                    sys.executable,
+                                    "-c",
+                                    (
+                                        "import sys; from pathlib import Path; "
+                                        "path = Path(sys.argv[1]); "
+                                        "sys.exit(f'missing: {path}') "
+                                        "if not path.exists() else "
+                                        "Path('quality-paths').open('a').write("
+                                        "sys.argv[1] + '\\n')"
+                                    ),
+                                    "{file}",
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
     def test_dangerous_shell_command_is_denied(self) -> None:
         result = self.run_hook(
             {
@@ -276,11 +309,38 @@ class PortableHookCliTests(unittest.TestCase):
                     "Blocked destructive command: git push --force",
                 )
 
+    def test_short_force_pushes_are_denied(self) -> None:
+        for command in (
+            "git push -f origin main",
+            "git push origin main -f",
+        ):
+            with self.subTest(command=command):
+                result = self.run_hook(
+                    {
+                        "schema": "agent-hooks/v1",
+                        "event": "before_tool",
+                        "cwd": str(ROOT),
+                        "agent": "test",
+                        "tool": {"name": "shell", "command": command},
+                    }
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(
+                    json.loads(result.stdout)["message"],
+                    "Blocked destructive command: git push --force",
+                )
+
     def test_force_option_prefixes_are_not_treated_as_forced_pushes(self) -> None:
         for command in (
+            "git push -u origin main",
+            "git push --follow-tags origin main",
             "git push --force-if-includes origin main",
             "git push --forceful origin main",
             "git push --force-with-leaseholder origin main",
+            "git push origin -- -f",
+            "printf '%s\\n' 'git push -f origin main'",
+            'echo "git push -f origin main"',
         ):
             with self.subTest(command=command):
                 result = self.run_hook(
@@ -1063,6 +1123,25 @@ class PortableHookCliTests(unittest.TestCase):
             },
         )
 
+    def test_codex_apply_patch_delete_paths_are_checked(self) -> None:
+        result = self.run_codex_patch(
+            "*** Begin Patch\n"
+            "*** Delete File: .env.production\n"
+            "*** End Patch"
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            json.loads(result.stdout)["hookSpecificOutput"],
+            {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Blocked protected path: .env.production"
+                ),
+            },
+        )
+
     def test_codex_apply_patch_move_destinations_are_checked(self) -> None:
         destinations = (
             ".env.production",
@@ -1082,7 +1161,6 @@ class PortableHookCliTests(unittest.TestCase):
                     "+new\n"
                     "*** End Patch"
                 )
-
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(
                     json.loads(result.stdout)["hookSpecificOutput"],
@@ -1095,6 +1173,27 @@ class PortableHookCliTests(unittest.TestCase):
                     },
                 )
 
+    def test_codex_apply_patch_move_sources_are_checked(self) -> None:
+        result = self.run_codex_patch(
+            "*** Begin Patch\n"
+            "*** Update File: .env.production\n"
+            "*** Move to: docs/environment.txt\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            json.loads(result.stdout)["hookSpecificOutput"],
+            {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Blocked protected path: .env.production"
+                ),
+            },
+        )
+
     def test_codex_apply_patch_allows_ordinary_move_destination(self) -> None:
         result = self.run_codex_patch(
             "*** Begin Patch\n"
@@ -1105,6 +1204,123 @@ class PortableHookCliTests(unittest.TestCase):
             "+new\n"
             "*** End Patch"
         )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+
+    def test_codex_post_patch_skips_deleted_files_for_quality_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            result = self.run_hook(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": str(project),
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "command": (
+                            "*** Begin Patch\n"
+                            "*** Delete File: deleted.py\n"
+                            "*** End Patch"
+                        )
+                    },
+                },
+                adapter="codex",
+                config=config,
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-paths").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+
+    def test_codex_post_patch_runs_quality_hook_for_move_destination_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            (project / "docs").mkdir()
+            (project / "docs" / "new.py").touch()
+            config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            result = self.run_hook(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": str(project),
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "command": (
+                            "*** Begin Patch\n"
+                            "*** Update File: old.py\n"
+                            "*** Move to: docs/new.py\n"
+                            "@@\n-old\n+new\n"
+                            "*** End Patch"
+                        )
+                    },
+                },
+                adapter="codex",
+                config=config,
+                environment=environment,
+            )
+
+            self.assertEqual(
+                (project / "quality-paths").read_text(),
+                "docs/new.py\n",
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+
+    def test_codex_post_patch_runs_quality_hooks_for_add_and_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            (project / "added.py").touch()
+            (project / "updated.py").touch()
+            config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            result = self.run_hook(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": str(project),
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "command": (
+                            "*** Begin Patch\n"
+                            "*** Add File: added.py\n"
+                            "+new\n"
+                            "*** Update File: updated.py\n"
+                            "@@\n-old\n+new\n"
+                            "*** End Patch"
+                        )
+                    },
+                },
+                adapter="codex",
+                config=config,
+                environment=environment,
+            )
+
+            self.assertEqual(
+                (project / "quality-paths").read_text(),
+                "added.py\nupdated.py\n",
+            )
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), {})
