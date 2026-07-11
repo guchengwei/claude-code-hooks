@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -132,6 +135,14 @@ class HookResult:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class LoadedConfig:
+    config: dict[str, Any]
+    repository_root: Path
+    path: Path | None = None
+    warning: str | None = None
+
+
 ADAPTERS = {
     "canonical": AdapterSpec(None, "canonical"),
     "claude": AdapterSpec(EVENT_NAMES, "claude"),
@@ -153,6 +164,10 @@ DEFAULT_PROTECTED_PATHS = (
     "secrets/**",
     "**/secrets/**",
 )
+
+TRUST_STORE_ENV = "AGENT_HOOKS_TRUST_STORE"
+TRUST_STORE_VERSION = 1
+TRUST_DIGEST_FIELD = "quality_after_write_sha256"
 
 WRITE_TOOL_NAMES = {
     "apply_patch",
@@ -295,30 +310,167 @@ def validate_config(config: Any) -> dict[str, Any]:
     return config
 
 
-def load_config(
-    path: Path | None, cwd: str | None
-) -> tuple[dict[str, Any], str | None]:
-    if path is None and cwd:
-        working_directory = Path(cwd).resolve()
-        repository_root = next(
-            (
-                directory
-                for directory in (working_directory, *working_directory.parents)
-                if (directory / ".git").exists()
-            ),
-            working_directory,
-        )
+def canonical_repository_root(cwd: str | Path | None) -> Path:
+    working_directory = Path(cwd or os.getcwd()).expanduser().resolve()
+    return next(
+        (
+            directory
+            for directory in (working_directory, *working_directory.parents)
+            if is_git_repository_root(directory)
+        ),
+        working_directory,
+    )
+
+
+def is_git_repository_root(directory: Path) -> bool:
+    marker = directory / ".git"
+    if marker.is_file():
+        return True
+    return marker.is_dir() and (marker / "HEAD").is_file()
+
+
+def load_config(path: Path | None, cwd: str | None) -> LoadedConfig:
+    repository_root = canonical_repository_root(cwd)
+    if path is None:
         discovered_config = repository_root / ".agent-hooks.json"
         if discovered_config.is_file():
             path = discovered_config
+    else:
+        path = path.expanduser().resolve()
     if path is None:
-        return {}, None
+        return LoadedConfig({}, repository_root)
     try:
         with path.open(encoding="utf-8") as file:
             config = validate_config(json.load(file))
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        return {}, f"Ignoring invalid configuration at {path}: {error}"
-    return config, None
+        return LoadedConfig(
+            {},
+            repository_root,
+            path,
+            f"Ignoring invalid configuration at {path}: {error}",
+        )
+    return LoadedConfig(config, repository_root, path)
+
+
+def execution_config_digest(config: Mapping[str, Any]) -> str | None:
+    hooks = config.get("quality", {}).get("after_write", [])
+    if not hooks:
+        return None
+    effective_hooks = [
+        {
+            "name": hook["name"],
+            "include": hook.get("include", ["*"]),
+            "command": hook["command"],
+            "timeout": hook.get("timeout", 30),
+        }
+        for hook in hooks
+    ]
+    encoded = json.dumps(
+        effective_hooks,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def trust_store_path() -> Path:
+    override = os.environ.get(TRUST_STORE_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return (base / "agent-hooks" / "trusted-repositories.json").resolve()
+
+
+def path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_trust_store(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("version") != TRUST_STORE_VERSION:
+        raise ValueError(f"trust store version must be {TRUST_STORE_VERSION}")
+    repositories = value.get("repositories")
+    if not isinstance(repositories, dict):
+        raise ValueError("repositories must be an object")
+    for repository, entry in repositories.items():
+        if not isinstance(repository, str) or not Path(repository).is_absolute():
+            raise ValueError("repository keys must be absolute paths")
+        if not isinstance(entry, dict):
+            raise ValueError(f"trust entry for {repository} must be an object")
+        digest = entry.get(TRUST_DIGEST_FIELD)
+        if not isinstance(digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", digest
+        ):
+            raise ValueError(
+                f"trust entry for {repository} has an invalid digest"
+            )
+    return value
+
+
+def load_trust_store(
+    path: Path, repository_root: Path
+) -> tuple[dict[str, Any], str | None]:
+    if path_is_within(path, repository_root):
+        return (
+            {"version": TRUST_STORE_VERSION, "repositories": {}},
+            f"Ignoring trust store inside repository at {path}",
+        )
+    try:
+        with path.open(encoding="utf-8") as file:
+            return validate_trust_store(json.load(file)), None
+    except FileNotFoundError:
+        return {"version": TRUST_STORE_VERSION, "repositories": {}}, None
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return (
+            {"version": TRUST_STORE_VERSION, "repositories": {}},
+            f"Ignoring invalid trust store at {path}: {error}",
+        )
+
+
+def write_trust_store(path: Path, store: Mapping[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(store, file, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def quality_trust_status(
+    config: Mapping[str, Any], repository_root: Path
+) -> tuple[bool, str | None]:
+    digest = execution_config_digest(config)
+    if digest is None:
+        return True, None
+    store, warning = load_trust_store(trust_store_path(), repository_root)
+    if warning:
+        return False, warning
+    entry = store["repositories"].get(str(repository_root), {})
+    return entry.get(TRUST_DIGEST_FIELD) == digest, None
+
+
+def combine_warnings(*warnings: str | None) -> str | None:
+    messages = [warning for warning in warnings if warning]
+    return " ".join(messages) if messages else None
 
 
 def path_matches(path: str, pattern: str) -> bool:
@@ -342,9 +494,13 @@ def tool_files(tool: Mapping[str, Any]) -> list[str]:
 
 
 def evaluate(
-    event: dict[str, Any], config: dict[str, Any]
+    event: dict[str, Any],
+    config: dict[str, Any],
+    quality_trusted: bool = True,
 ) -> HookResult:
     if event.get("event") == "after_tool":
+        if not quality_trusted:
+            return HookResult("allow")
         return run_quality_commands(event, config)
     if event.get("event") != "before_tool":
         return HookResult("allow")
@@ -376,6 +532,25 @@ def evaluate(
                 )
 
     return HookResult("allow")
+
+
+def quality_commands_applicable(
+    event: Mapping[str, Any], config: Mapping[str, Any]
+) -> bool:
+    if event.get("event") != "after_tool":
+        return False
+    tool = event.get("tool") or {}
+    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+        return False
+    file_paths = tool_files(tool)
+    for file_path in file_paths:
+        for hook in config.get("quality", {}).get("after_write", []):
+            if any(
+                path_matches(file_path, pattern)
+                for pattern in hook.get("include", ["*"])
+            ):
+                return True
+    return False
 
 
 def run_quality_commands(
@@ -433,6 +608,22 @@ def run_quality_commands(
     return HookResult("allow")
 
 
+def skipped_quality_warning(loaded: LoadedConfig) -> str:
+    command = [
+        str(Path(__file__).resolve()),
+        "trust",
+        "--repository",
+        str(loaded.repository_root),
+    ]
+    if loaded.path is not None:
+        command.extend(["--config", str(loaded.path)])
+    config_label = str(loaded.path or ".agent-hooks.json")
+    return (
+        "Skipped untrusted repository quality commands. "
+        f"Review {config_label}, then run: {shlex.join(command)}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-hooks")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -443,7 +634,85 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     handle.add_argument("--config", type=Path)
+    trust = subparsers.add_parser(
+        "trust",
+        help="trust executable quality configuration for a repository",
+    )
+    trust.add_argument("--repository", type=Path)
+    trust.add_argument("--config", type=Path)
+    untrust = subparsers.add_parser(
+        "untrust",
+        help="revoke executable quality configuration trust",
+    )
+    untrust.add_argument("--repository", type=Path, default=Path.cwd())
     return parser
+
+
+def trust_repository(repository: Path | None, config_path: Path | None) -> int:
+    if repository is None:
+        repository = (
+            config_path.expanduser().resolve().parent
+            if config_path is not None
+            else Path.cwd()
+        )
+    loaded = load_config(config_path, str(repository))
+    if loaded.warning:
+        print(f"Cannot trust configuration: {loaded.warning}", file=sys.stderr)
+        return 2
+    if loaded.path is None:
+        print(
+            f"Cannot trust configuration: no .agent-hooks.json found at "
+            f"{loaded.repository_root}",
+            file=sys.stderr,
+        )
+        return 2
+    digest = execution_config_digest(loaded.config)
+    if digest is None:
+        print(
+            f"Cannot trust configuration: {loaded.path} has no executable "
+            "quality.after_write commands",
+            file=sys.stderr,
+        )
+        return 2
+
+    store_path = trust_store_path()
+    store, warning = load_trust_store(store_path, loaded.repository_root)
+    if warning:
+        print(f"Cannot update trust: {warning}", file=sys.stderr)
+        return 2
+    store["repositories"][str(loaded.repository_root)] = {
+        TRUST_DIGEST_FIELD: digest
+    }
+    try:
+        write_trust_store(store_path, store)
+    except OSError as error:
+        print(f"Cannot update trust store at {store_path}: {error}", file=sys.stderr)
+        return 2
+    print(
+        f"Trusted quality commands for {loaded.repository_root} "
+        f"({digest[:12]})."
+    )
+    return 0
+
+
+def untrust_repository(repository: Path) -> int:
+    repository_root = canonical_repository_root(repository)
+    store_path = trust_store_path()
+    store, warning = load_trust_store(store_path, repository_root)
+    if warning:
+        print(f"Cannot update trust: {warning}", file=sys.stderr)
+        return 2
+    removed = store["repositories"].pop(str(repository_root), None)
+    if removed is None:
+        print(f"Quality commands for {repository_root} are not trusted.")
+        return 0
+    try:
+        write_trust_store(store_path, store)
+    except OSError as error:
+        print(f"Cannot update trust store at {store_path}: {error}", file=sys.stderr)
+        return 2
+    print(f"Revoked quality command trust for {repository_root}.")
+    return 0
 
 
 def render(
@@ -495,14 +764,27 @@ def render(
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.command != "handle":
-        return 64
+    if args.command == "trust":
+        return trust_repository(args.repository, args.config)
+    if args.command == "untrust":
+        return untrust_repository(args.repository)
 
     raw_event = json.load(sys.stdin)
     adapter = resolve_adapter(args.adapter, raw_event)
     event = normalize(adapter, raw_event)
-    config, warning = load_config(args.config, event.get("cwd"))
-    result = evaluate(event, config)
+    loaded = load_config(args.config, event.get("cwd"))
+    quality_trusted, trust_warning = quality_trust_status(
+        loaded.config, loaded.repository_root
+    )
+    quality_skipped = not quality_trusted and quality_commands_applicable(
+        event, loaded.config
+    )
+    warning = combine_warnings(
+        loaded.warning,
+        trust_warning,
+        skipped_quality_warning(loaded) if quality_skipped else None,
+    )
+    result = evaluate(event, loaded.config, quality_trusted)
     exit_code, output = render(adapter, event, result, warning)
     json.dump(output, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")

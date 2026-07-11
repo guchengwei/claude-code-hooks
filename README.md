@@ -60,7 +60,8 @@ The installed plugin:
 - protects `.git/`, environment files, private keys, and `secrets/` paths;
 - allows lockfile changes;
 - does not install dependencies;
-- does not run formatters, linters, or tests unless configured;
+- does not run formatters, linters, or tests unless configured and explicitly
+  trusted for the repository;
 - does not change Git identity, stage files, commit, push, or open pull requests;
 - does not write command or transcript logs.
 
@@ -90,8 +91,54 @@ Add `.agent-hooks.json` at the repository root to extend protected paths or opt 
 ```
 
 Quality commands are argument arrays, not shell strings. `{file}` and `{cwd}` are replaced before execution. Commands run from the event's repository working directory.
+The [`examples/` workflow](examples/README.md) shows how to activate the bundled
+example safely.
 
-Only enable repository-defined quality commands in repositories you trust: they execute local programs with your user permissions.
+Declarative safety settings such as `additional_protected_paths` take effect
+immediately. Repository-defined `quality.after_write` commands are skipped until
+you explicitly trust their execution-bearing configuration. After reviewing the
+file, run the exact trust command shown in the hook's skip warning. From a source
+checkout, the equivalent command is:
+
+```bash
+plugins/coding-agent-hooks/bin/agent-hooks trust --repository "$PWD"
+```
+
+An explicitly supplied configuration requires the same recorded trust:
+
+```bash
+plugins/coding-agent-hooks/bin/agent-hooks trust \
+  --repository /path/to/repository \
+  --config /path/to/repository/agent-hooks.json
+```
+
+Trust is bound to the repository's canonical path and a SHA-256 digest of the
+effective `quality.after_write` entries. Changing a command, include pattern,
+name, timeout, or hook order makes the quality configuration untrusted until you
+review and trust it again. Changing only declarative safety paths does not revoke
+quality trust or prevent the new protections from applying.
+
+Revoke trust at any time:
+
+```bash
+plugins/coding-agent-hooks/bin/agent-hooks untrust --repository "$PWD"
+```
+
+The trust store contains digests, not raw commands. It is written outside the
+repository at `$XDG_CONFIG_HOME/agent-hooks/trusted-repositories.json` (or
+`~/.config/agent-hooks/trusted-repositories.json`).
+`AGENT_HOOKS_TRUST_STORE` can override that location for isolated tests or
+managed deployments, but a location inside the repository is refused. Missing
+or malformed trust state disables executable quality hooks without disabling
+default or declarative safety rules. Trust-store updates use atomic replacement;
+the file is mode `0600` on POSIX systems and otherwise relies on the platform's
+best-effort per-user file protection.
+
+This gate prevents a cloned repository from silently triggering its configured
+quality commands. It is not a sandbox or a boundary against malicious code with
+the same user identity: a process that can modify the external trust store can
+bypass it. Run `trust` yourself outside agent-controlled execution, and keep the
+agent's native approval, sandbox, and least-privilege controls enabled.
 
 ## Portable interface
 
