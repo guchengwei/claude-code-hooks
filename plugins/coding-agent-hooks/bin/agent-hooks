@@ -43,7 +43,7 @@ DESTRUCTIVE_COMMANDS = (
         re.compile(
             r"\bgit\s+push\b"
             r"(?:(?!\s--(?=\s|[;&|]|$))[^;&|\n])*\s(?:"
-            r"--force(?:-with-lease(?:=[^\s;&|]+)?)?|-f"
+            r"--force(?:-with-lease(?:=[^\s;&|]+)?)?|-(?!-)[A-Za-z]*f[A-Za-z]*"
             r")(?=\s|[;&|]|$)",
             re.IGNORECASE,
         ),

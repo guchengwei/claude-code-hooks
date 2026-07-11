@@ -313,6 +313,9 @@ class PortableHookCliTests(unittest.TestCase):
         for command in (
             "git push -f origin main",
             "git push origin main -f",
+            "git push -uf origin main",
+            "git push -fu origin main",
+            "git push -nuf origin main",
         ):
             with self.subTest(command=command):
                 result = self.run_hook(
@@ -334,11 +337,14 @@ class PortableHookCliTests(unittest.TestCase):
     def test_force_option_prefixes_are_not_treated_as_forced_pushes(self) -> None:
         for command in (
             "git push -u origin main",
+            "git push -un origin main",
+            "git push -nuv origin main",
             "git push --follow-tags origin main",
             "git push --force-if-includes origin main",
             "git push --forceful origin main",
             "git push --force-with-leaseholder origin main",
             "git push origin -- -f",
+            "git push origin -- -nuf",
             "printf '%s\\n' 'git push -f origin main'",
             'echo "git push -f origin main"',
         ):
