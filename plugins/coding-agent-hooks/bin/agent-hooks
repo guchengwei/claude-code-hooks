@@ -37,12 +37,25 @@ DESTRUCTIVE_COMMANDS = (
     ),
     (re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE), "git reset --hard"),
     (
-        re.compile(r"\bgit\s+push\b[^\n]*\s--force(?:\s|$)", re.IGNORECASE),
+        re.compile(
+            r"\bgit\s+push\b[^\n]*\s--force"
+            r"(?:-with-lease(?:=[^\s;&|]+)?)?(?=\s|[;&|]|$)",
+            re.IGNORECASE,
+        ),
         "git push --force",
     ),
     (
         re.compile(
-            r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba|z)?sh\b",
+            SHELL_COMMAND_START
+            + r"(?:curl|wget)\b[^\n|]*\|\s*"
+            + r"(?:(?:(?:/[A-Za-z0-9._+-]+)*/)?"
+            + r"(?:(?:sudo|doas)"
+            + r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user"
+            + r"(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
+            + r"|(?:command|exec|env|nohup|time)"
+            + r"(?:\s+(?:-[^\s;&|(){}]+|[A-Za-z_]\w*=[^\s;&|(){}]+))*"
+            + r")\s+)*"
+            + r"(?:(?:/[A-Za-z0-9._+-]+)*/)?(?:ba|z)?sh\b",
             re.IGNORECASE,
         ),
         "remote script pipe",
@@ -160,6 +173,7 @@ WRITE_TOOL_NAMES = {
     "edit",
     "editfiles",
     "insert_edit_into_file",
+    "multiedit",
     "multi_replace_string_in_file",
     "notebookedit",
     "replace",
