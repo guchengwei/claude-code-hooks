@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ class PortableHookCliTests(unittest.TestCase):
         event: dict,
         adapter: str = "canonical",
         config: Path | None = None,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [str(CLI), "handle", "--adapter", adapter]
         if config is not None:
@@ -28,7 +30,66 @@ class PortableHookCliTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            env=environment,
         )
+
+    def trust_environment(self, base: Path) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment["AGENT_HOOKS_TRUST_STORE"] = str(
+            base / "state" / "trusted-repositories.json"
+        )
+        return environment
+
+    def run_trust_command(
+        self,
+        repository: Path,
+        environment: dict[str, str],
+        config: Path | None = None,
+        revoke: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            str(CLI),
+            "untrust" if revoke else "trust",
+            "--repository",
+            str(repository),
+        ]
+        if config is not None and not revoke:
+            command.extend(["--config", str(config)])
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+
+    def write_quality_config(
+        self,
+        path: Path,
+        script: str,
+        protected_paths: list[str] | None = None,
+        timeout: int | float | None = None,
+    ) -> None:
+        config: dict = {
+            "version": 1,
+            "quality": {
+                "after_write": [
+                    {
+                        "name": "record-python-write",
+                        "include": ["*.py"],
+                        "command": [sys.executable, "-c", script],
+                    }
+                ]
+            },
+        }
+        if timeout is not None:
+            config["quality"]["after_write"][0]["timeout"] = timeout
+        if protected_paths is not None:
+            config["safety"] = {
+                "additional_protected_paths": protected_paths
+            }
+        path.write_text(json.dumps(config), encoding="utf-8")
 
     def assert_shell_decision(
         self, command: str, decision: Literal["allow", "deny"]
@@ -343,7 +404,9 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_configured_after_write_command_runs_for_matching_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = project / "agent-hooks.json"
             config.write_text(
                 json.dumps(
@@ -369,6 +432,16 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            store_path = Path(environment["AGENT_HOOKS_TRUST_STORE"])
+            store_text = store_path.read_text(encoding="utf-8")
+            self.assertNotIn("quality-ran", store_text)
+            if os.name == "posix":
+                self.assertEqual(store_path.stat().st_mode & 0o777, 0o600)
 
             result = self.run_hook(
                 {
@@ -379,6 +452,7 @@ class PortableHookCliTests(unittest.TestCase):
                     "tool": {"name": "write", "file": "src/app.py"},
                 },
                 config=config,
+                environment=environment,
             )
 
             self.assertEqual((project / "quality-ran").read_text(), "ok")
@@ -388,7 +462,9 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_quality_failure_is_reported_as_post_tool_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = project / "agent-hooks.json"
             config.write_text(
                 json.dumps(
@@ -411,6 +487,11 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
 
             result = self.run_hook(
                 {
@@ -421,6 +502,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="claude",
                 config=config,
+                environment=environment,
             )
 
         message = "Quality hook 'lint' failed: lint failed"
@@ -436,6 +518,383 @@ class PortableHookCliTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_untrusted_auto_discovered_quality_command_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            marker = project / "quality-ran"
+            self.write_quality_config(
+                project / ".agent-hooks.json",
+                "from pathlib import Path; Path('quality-ran').touch()",
+            )
+            environment = self.trust_environment(base)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertFalse(marker.exists())
+            self.assertFalse(
+                Path(environment["AGENT_HOOKS_TRUST_STORE"]).exists()
+            )
+
+        self.assertEqual(result.returncode, 0)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "allow")
+        self.assertIn("Skipped untrusted repository quality commands", output["warning"])
+        self.assertIn(f"{CLI.resolve()} trust", output["warning"])
+
+    def test_declarative_safety_applies_while_quality_is_untrusted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            self.write_quality_config(
+                project / ".agent-hooks.json",
+                "from pathlib import Path; Path('must-not-run').touch()",
+                protected_paths=["production/**"],
+            )
+            environment = self.trust_environment(base)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "write",
+                        "file": "production/credentials.json",
+                    },
+                },
+                environment=environment,
+            )
+            default_result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "shell",
+                        "command": "git reset --hard HEAD",
+                    },
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "must-not-run").exists())
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(
+            json.loads(result.stdout)["message"],
+            "Blocked protected path: production/credentials.json",
+        )
+        self.assertEqual(default_result.returncode, 2)
+        self.assertEqual(
+            json.loads(default_result.stdout)["message"],
+            "Blocked destructive command: git reset --hard",
+        )
+
+    def test_explicit_config_also_requires_recorded_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / "agent-hooks.json"
+            self.write_quality_config(
+                config,
+                "from pathlib import Path; Path('quality-ran').touch()",
+            )
+            environment = self.trust_environment(base)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                config=config,
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-ran").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipped untrusted", json.loads(result.stdout)["warning"])
+
+    def test_changing_execution_config_invalidates_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / ".agent-hooks.json"
+            self.write_quality_config(
+                config,
+                "from pathlib import Path; Path('old-command-ran').touch()",
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            self.write_quality_config(
+                config,
+                "from pathlib import Path; Path('changed-command-ran').touch()",
+            )
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "old-command-ran").exists())
+            self.assertFalse((project / "changed-command-ran").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipped untrusted", json.loads(result.stdout)["warning"])
+
+    def test_large_integer_timeout_change_invalidates_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / ".agent-hooks.json"
+            script = "from pathlib import Path; Path('quality-ran').touch()"
+            self.write_quality_config(
+                config, script, timeout=9_007_199_254_740_992
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            self.write_quality_config(
+                config, script, timeout=9_007_199_254_740_993
+            )
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-ran").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipped untrusted", json.loads(result.stdout)["warning"])
+
+    def test_declarative_safety_change_does_not_invalidate_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            config = project / ".agent-hooks.json"
+            script = "from pathlib import Path; Path('quality-ran').touch()"
+            self.write_quality_config(config, script, protected_paths=[])
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            self.write_quality_config(
+                config, script, protected_paths=["production/**"]
+            )
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertTrue((project / "quality-ran").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"decision": "allow"})
+
+    def test_trust_is_bound_to_canonical_repository_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository_a = base / "repository-a"
+            repository_b = base / "repository-b"
+            repository_a.mkdir()
+            repository_b.mkdir()
+            script = "from pathlib import Path; Path('quality-ran').touch()"
+            self.write_quality_config(
+                repository_a / ".agent-hooks.json", script
+            )
+            self.write_quality_config(
+                repository_b / ".agent-hooks.json", script
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(repository_a, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            def after_write(repository: Path) -> subprocess.CompletedProcess[str]:
+                return self.run_hook(
+                    {
+                        "schema": "agent-hooks/v1",
+                        "event": "after_tool",
+                        "cwd": str(repository),
+                        "agent": "test",
+                        "tool": {"name": "write", "file": "src/app.py"},
+                    },
+                    environment=environment,
+                )
+
+            trusted_result = after_write(repository_a)
+            untrusted_result = after_write(repository_b)
+
+            self.assertTrue((repository_a / "quality-ran").exists())
+            self.assertFalse((repository_b / "quality-ran").exists())
+
+        self.assertEqual(trusted_result.returncode, 0)
+        self.assertEqual(
+            json.loads(trusted_result.stdout), {"decision": "allow"}
+        )
+        self.assertIn(
+            "Skipped untrusted",
+            json.loads(untrusted_result.stdout)["warning"],
+        )
+
+    def test_untrust_revokes_quality_command_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            self.write_quality_config(
+                project / ".agent-hooks.json",
+                "from pathlib import Path; Path('quality-ran').touch()",
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(project, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            untrust = self.run_trust_command(
+                project, environment, revoke=True
+            )
+            self.assertEqual(untrust.returncode, 0, untrust.stderr)
+
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-ran").exists())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipped untrusted", json.loads(result.stdout)["warning"])
+
+    def test_malformed_trust_store_fails_closed_without_disabling_safety(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            self.write_quality_config(
+                project / ".agent-hooks.json",
+                "from pathlib import Path; Path('quality-ran').touch()",
+            )
+            environment = self.trust_environment(base)
+            store_path = Path(environment["AGENT_HOOKS_TRUST_STORE"])
+            store_path.parent.mkdir()
+            store_path.write_text("{not-json", encoding="utf-8")
+
+            quality_result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+            safety_result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {
+                        "name": "shell",
+                        "command": "git reset --hard HEAD",
+                    },
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-ran").exists())
+
+        quality_output = json.loads(quality_result.stdout)
+        self.assertEqual(quality_output["decision"], "allow")
+        self.assertIn("Ignoring invalid trust store", quality_output["warning"])
+        self.assertIn("Skipped untrusted", quality_output["warning"])
+        self.assertEqual(safety_result.returncode, 2)
+        self.assertEqual(
+            json.loads(safety_result.stdout)["message"],
+            "Blocked destructive command: git reset --hard",
+        )
+
+    def test_trust_store_inside_repository_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.write_quality_config(
+                project / ".agent-hooks.json",
+                "from pathlib import Path; Path('quality-ran').touch()",
+            )
+            environment = os.environ.copy()
+            environment["AGENT_HOOKS_TRUST_STORE"] = str(
+                project / ".agent-hooks-state" / "trust.json"
+            )
+
+            trust = self.run_trust_command(project, environment)
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "after_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "write", "file": "src/app.py"},
+                },
+                environment=environment,
+            )
+
+            self.assertFalse((project / "quality-ran").exists())
+            self.assertFalse(
+                Path(environment["AGENT_HOOKS_TRUST_STORE"]).exists()
+            )
+
+        self.assertEqual(trust.returncode, 2)
+        self.assertIn("trust store inside repository", trust.stderr)
+        output = json.loads(result.stdout)
+        self.assertIn("Ignoring trust store inside repository", output["warning"])
+        self.assertIn("Skipped untrusted", output["warning"])
 
     def test_repository_config_is_discovered_from_event_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -475,6 +934,9 @@ class PortableHookCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             (project / ".git").mkdir()
+            (project / ".git" / "HEAD").write_text(
+                "ref: refs/heads/main\n", encoding="utf-8"
+            )
             nested_directory = project / "packages" / "service"
             nested_directory.mkdir(parents=True)
             (project / ".agent-hooks.json").write_text(
@@ -585,7 +1047,9 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_claude_multiedit_runs_after_write_quality_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = project / "agent-hooks.json"
             config.write_text(
                 json.dumps(
@@ -608,6 +1072,11 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
 
             result = self.run_hook(
                 {
@@ -618,6 +1087,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="claude",
                 config=config,
+                environment=environment,
             )
 
             self.assertTrue((project / "ran").exists())
@@ -749,8 +1219,15 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_codex_post_patch_skips_deleted_files_for_quality_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
             result = self.run_hook(
                 {
                     "hook_event_name": "PostToolUse",
@@ -766,6 +1243,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="codex",
                 config=config,
+                environment=environment,
             )
 
             self.assertFalse((project / "quality-paths").exists())
@@ -775,10 +1253,17 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_codex_post_patch_runs_quality_hook_for_move_destination_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             (project / "docs").mkdir()
             (project / "docs" / "new.py").touch()
             config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
             result = self.run_hook(
                 {
                     "hook_event_name": "PostToolUse",
@@ -796,6 +1281,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="codex",
                 config=config,
+                environment=environment,
             )
 
             self.assertEqual(
@@ -808,10 +1294,17 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_codex_post_patch_runs_quality_hooks_for_add_and_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             (project / "added.py").touch()
             (project / "updated.py").touch()
             config = self.write_path_recording_quality_config(project)
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
             result = self.run_hook(
                 {
                     "hook_event_name": "PostToolUse",
@@ -830,6 +1323,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="codex",
                 config=config,
+                environment=environment,
             )
 
             self.assertEqual(
@@ -842,7 +1336,9 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_quality_commands_do_not_run_after_read_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = project / "agent-hooks.json"
             config.write_text(
                 json.dumps(
@@ -865,6 +1361,11 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
 
             result = self.run_hook(
                 {
@@ -875,6 +1376,7 @@ class PortableHookCliTests(unittest.TestCase):
                 },
                 adapter="claude",
                 config=config,
+                environment=environment,
             )
 
             self.assertFalse((project / "ran").exists())
@@ -1112,7 +1614,9 @@ class PortableHookCliTests(unittest.TestCase):
 
     def test_missing_quality_command_is_reported_without_a_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
             config = project / "agent-hooks.json"
             config.write_text(
                 json.dumps(
@@ -1131,6 +1635,11 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(
+                project, environment, config=config
+            )
+            self.assertEqual(trust.returncode, 0, trust.stderr)
 
             result = self.run_hook(
                 {
@@ -1141,6 +1650,7 @@ class PortableHookCliTests(unittest.TestCase):
                     "tool": {"name": "write", "file": "src/app.py"},
                 },
                 config=config,
+                environment=environment,
             )
 
         self.assertEqual(result.returncode, 2)
