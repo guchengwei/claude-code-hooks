@@ -2,6 +2,8 @@
 
 Copy `agent-hooks.json` to `.agent-hooks.json` at the root of the repository.
 Its declarative `safety.additional_protected_paths` rule applies immediately.
+The example leaves `safety.strict_workspace` off. Set it to `true` only when
+the agent is launched as a non-root user from a Git repository/worktree.
 The `quality.after_write` command remains disabled until you review the copied
 file and explicitly trust it.
 
@@ -24,3 +26,9 @@ canonical path plus a digest of the executable configuration. This prevents
 silent execution from an unreviewed repository config; it does not constrain a
 process running as the same user that can modify the external trust store. Keep
 the coding agent's sandbox and approval controls enabled.
+
+Before launching an agent, run `agent-hooks doctor --cwd /path/to/repository`.
+For stronger isolation, use an ephemeral clone or worktree with a project-only
+mount, no host home/credential or Docker-socket mounts, and network/resource
+limits. The direct-file path guard does not contain shell commands; keep the
+native agent sandbox enabled.
