@@ -38,8 +38,10 @@ DESTRUCTIVE_COMMANDS = (
     (re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE), "git reset --hard"),
     (
         re.compile(
-            r"\bgit\s+push\b[^\n]*\s--force"
-            r"(?:-with-lease(?:=[^\s;&|]+)?)?(?=\s|[;&|]|$)",
+            r"\bgit\s+push\b"
+            r"(?:(?!\s--(?=\s|[;&|]|$))[^;&|\n])*\s(?:"
+            r"--force(?:-with-lease(?:=[^\s;&|]+)?)?|-f"
+            r")(?=\s|[;&|]|$)",
             re.IGNORECASE,
         ),
         "git push --force",
@@ -154,7 +156,7 @@ ADAPTERS = {
 }
 
 PATCH_FILE_PATTERN = re.compile(
-    r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
+    r"^\*\*\* ((?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
 )
 
 DEFAULT_PROTECTED_PATHS = (
@@ -212,12 +214,17 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(tool_input, dict):
         tool_input = {}
     tool_name = raw.get("tool_name") or ""
-    files = extract_files(tool_name, tool_input)
+    event_name = adapter_spec.event_names.get(
+        raw.get("hook_event_name"), "unknown"
+    )
+    files = extract_files(
+        tool_name,
+        tool_input,
+        after_tool=event_name == "after_tool",
+    )
     return {
         "schema": "agent-hooks/v1",
-        "event": adapter_spec.event_names.get(
-            raw.get("hook_event_name"), "unknown"
-        ),
+        "event": event_name,
         "cwd": raw.get("cwd"),
         "agent": adapter,
         "tool": {
@@ -240,7 +247,12 @@ def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
     return "claude"
 
 
-def extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
+def extract_files(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    after_tool: bool = False,
+) -> list[str]:
     files: list[str] = []
     direct_path = (
         tool_input.get("file_path")
@@ -261,7 +273,21 @@ def extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
 
     if tool_name.lower() == "apply_patch":
         command = tool_input.get("command") or ""
-        files.extend(PATCH_FILE_PATTERN.findall(command))
+        patch_files = PATCH_FILE_PATTERN.findall(command)
+        if after_tool:
+            for index, (action, path) in enumerate(patch_files):
+                next_action = (
+                    patch_files[index + 1][0]
+                    if index + 1 < len(patch_files)
+                    else None
+                )
+                if action == "Delete File":
+                    continue
+                if action == "Update File" and next_action == "Move to":
+                    continue
+                files.append(path)
+        else:
+            files.extend(path for _, path in patch_files)
 
     return list(dict.fromkeys(files))
 
