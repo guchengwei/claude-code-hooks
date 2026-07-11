@@ -58,6 +58,8 @@ The installed plugin:
 
 - blocks clear destructive commands such as recursive forced deletion, `git reset --hard`, forced pushes, and piping remote downloads into a shell;
 - protects `.git/`, environment files, private keys, and `secrets/` paths;
+- keeps direct filesystem-write tool targets inside the canonical Git workspace
+  root (or the event working directory when no Git root exists);
 - allows lockfile changes;
 - does not install dependencies;
 - does not run formatters, linters, or tests unless configured and explicitly
@@ -65,7 +67,48 @@ The installed plugin:
 - does not change Git identity, stage files, commit, push, or open pull requests;
 - does not write command or transcript logs.
 
-These checks are guardrails, not a security sandbox. Keep the agent's native approval and sandbox controls enabled.
+These checks are guardrails, not a security sandbox. The direct-file boundary
+does not contain shell commands or code executed by quality hooks. Keep the
+agent's native approval and sandbox controls enabled.
+
+## Workspace preflight and strict mode
+
+Before launching an agent, inspect the current context:
+
+```bash
+plugins/coding-agent-hooks/bin/agent-hooks doctor --cwd "$PWD"
+```
+
+`doctor` checks that the working directory exists, is not `/`, `/root`, or the
+current home directory, is inside a Git repository or worktree, and that the
+trust store is outside the workspace. It also reports an effective root user
+where the platform exposes that information. A reminder about the native
+sandbox is always shown because a lifecycle hook cannot prove sandbox status.
+Use `doctor --strict` to make a root effective user fail the preflight too.
+
+The optional strict mutation profile rejects direct filesystem mutations from
+root/home, a non-repository directory, or an effective root process. Enable it
+declaratively with `"strict_workspace": true` under `safety`, or for a managed
+launch with:
+
+```bash
+export AGENT_HOOKS_STRICT_WORKSPACE=1
+```
+
+The environment variable accepts `1/true/yes/on` and `0/false/no/off`. An
+invalid value fails closed for direct mutations. An existing repository config
+that is malformed, unreadable, or fails schema validation likewise blocks
+direct filesystem mutations while leaving read-only events available with a
+warning. Strict mode is off by default, so ordinary container environments that
+intentionally run as root do not start failing silently. Hook handling remains
+non-interactive.
+
+For stronger isolation, use a dedicated non-root user where practical and an
+isolated worktree or ephemeral clone. Mount only the project, not the host home,
+SSH agent, cloud credentials, or Docker socket. Apply network allowlists and
+CPU, memory, process, and runtime limits. A container with the host Docker
+socket is not a meaningful security boundary. Shell commands still require the
+agent's native sandbox; for untrusted code, use a hardened container or VM.
 
 ## Repository configuration
 
@@ -75,7 +118,8 @@ Add `.agent-hooks.json` at the repository root to extend protected paths or opt 
 {
   "version": 1,
   "safety": {
-    "additional_protected_paths": ["production/**"]
+    "additional_protected_paths": ["production/**"],
+    "strict_workspace": false
   },
   "quality": {
     "after_write": [
@@ -139,6 +183,24 @@ quality commands. It is not a sandbox or a boundary against malicious code with
 the same user identity: a process that can modify the external trust store can
 bypass it. Run `trust` yourself outside agent-controlled execution, and keep the
 agent's native approval, sandbox, and least-privilege controls enabled.
+
+For `filesystem_write` events, every reported path is resolved relative to the
+event working directory. Existing symlinks in the path are followed even when
+the final descendants do not yet exist. Absolute paths, `..` traversal, symlink
+escapes, and resolution failures outside the canonical workspace are denied.
+Multi-file operations and `apply_patch` move destinations use the same check.
+After-tool events with an outside target return feedback and do not run quality
+commands; that feedback does not claim the already-attempted write was undone.
+For patch events, boundary targets and quality targets are intentionally
+separate: pre-tool policy and post-tool boundary checks retain deletes, move
+sources, and move destinations, while post-tool quality commands receive only
+surviving add/update paths and move destinations. A delete-only patch therefore
+runs no quality command but is still workspace-checked.
+
+This boundary applies only when an adapter reports direct-file targets. It
+cannot constrain arbitrary paths embedded in `shell_execute`, subprocesses,
+MCP servers, compilers, or repository code. Those remain the responsibility of
+the native OS/container/VM sandbox.
 
 ## Portable interface
 

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -157,6 +158,7 @@ class LoadedConfig:
     repository_root: Path
     path: Path | None = None
     warning: str | None = None
+    valid: bool = True
 
 
 ADAPTERS = {
@@ -182,6 +184,7 @@ DEFAULT_PROTECTED_PATHS = (
 )
 
 TRUST_STORE_ENV = "AGENT_HOOKS_TRUST_STORE"
+STRICT_WORKSPACE_ENV = "AGENT_HOOKS_STRICT_WORKSPACE"
 TRUST_STORE_VERSION = 1
 TRUST_DIGEST_FIELD = "quality_after_write_sha256"
 
@@ -272,6 +275,7 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
         tool_input,
         after_tool=event_name == "after_tool",
     )
+    boundary_files = extract_files(tool_name, tool_input, after_tool=False)
     normalized_tool = {
         "name": tool_name,
         "command": tool_input.get("command"),
@@ -281,6 +285,9 @@ def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
     effects = classify_effects(normalized_tool)
     normalized_tool["effect"] = effects[0]
     normalized_tool["effects"] = list(effects)
+    # Post-tool quality targets intentionally omit deleted and obsolete move
+    # sources. Boundary targets retain every reported patch path.
+    normalized_tool["boundary_files"] = boundary_files
     return {
         "schema": "agent-hooks/v1",
         "event": event_name,
@@ -411,6 +418,9 @@ def validate_config(config: Any) -> dict[str, Any]:
         safety.get("additional_protected_paths", []),
         "safety.additional_protected_paths",
     )
+    strict_workspace = safety.get("strict_workspace", False)
+    if not isinstance(strict_workspace, bool):
+        raise ValueError("safety.strict_workspace must be a boolean")
 
     quality = config.get("quality", {})
     if not isinstance(quality, dict):
@@ -447,18 +457,63 @@ def canonical_repository_root(cwd: str | Path | None) -> Path:
     )
 
 
+def git_repository_root(cwd: str | Path | None) -> Path | None:
+    """Find a repository without invoking repository-controlled programs."""
+    working_directory = Path(cwd or os.getcwd()).expanduser().resolve()
+    return next(
+        (
+            directory
+            for directory in (working_directory, *working_directory.parents)
+            if is_git_repository_root(directory)
+        ),
+        None,
+    )
+
+
 def is_git_repository_root(directory: Path) -> bool:
     marker = directory / ".git"
-    if marker.is_file():
-        return True
-    return marker.is_dir() and (marker / "HEAD").is_file()
+    try:
+        if marker.is_symlink():
+            return False
+        if marker.is_dir():
+            return (marker / "HEAD").is_file()
+        if not marker.is_file():
+            return False
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        if len(lines) != 1:
+            return False
+        match = re.fullmatch(r"gitdir:\s+(.+)", lines[0])
+        if match is None or "\x00" in match.group(1):
+            return False
+        git_directory = Path(match.group(1))
+        if not git_directory.is_absolute():
+            git_directory = directory / git_directory
+        git_directory = git_directory.resolve(strict=True)
+        return git_directory.is_dir() and (git_directory / "HEAD").is_file()
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        return False
+
+
+def strict_workspace_enabled(config: Mapping[str, Any]) -> tuple[bool, str | None]:
+    override = os.environ.get(STRICT_WORKSPACE_ENV)
+    if override is None:
+        return bool(config.get("safety", {}).get("strict_workspace", False)), None
+    normalized = override.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, None
+    return False, (
+        f"{STRICT_WORKSPACE_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
 
 
 def load_config(path: Path | None, cwd: str | None) -> LoadedConfig:
     repository_root = canonical_repository_root(cwd)
     if path is None:
         discovered_config = repository_root / ".agent-hooks.json"
-        if discovered_config.is_file():
+        if os.path.lexists(discovered_config):
             path = discovered_config
     else:
         path = path.expanduser().resolve()
@@ -473,6 +528,7 @@ def load_config(path: Path | None, cwd: str | None) -> LoadedConfig:
             repository_root,
             path,
             f"Ignoring invalid configuration at {path}: {error}",
+            False,
         )
     return LoadedConfig(config, repository_root, path)
 
@@ -618,19 +674,168 @@ def tool_files(tool: Mapping[str, Any]) -> list[str]:
     return [str(path) for path in files]
 
 
+def boundary_tool_files(tool: Mapping[str, Any]) -> list[str]:
+    files = tool.get("boundary_files")
+    if files is None:
+        return tool_files(tool)
+    if not isinstance(files, list):
+        return []
+    return [str(path) for path in files]
+
+
+def resolve_workspace_target(
+    raw_path: str, cwd: str | Path | None, workspace_root: Path
+) -> tuple[Path | None, str | None]:
+    """Resolve a direct-file target, following every existing symlink parent."""
+    try:
+        if not raw_path or "\x00" in raw_path:
+            raise ValueError("path is empty or contains a NUL byte")
+        working_directory = Path(cwd or os.getcwd()).expanduser().resolve(strict=True)
+        if not working_directory.is_dir():
+            raise NotADirectoryError(f"cwd is not a directory: {working_directory}")
+        root = workspace_root.expanduser().resolve(strict=True)
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = working_directory / candidate
+        # Do not rely on Path.resolve() to reject symlink loops: its
+        # strict=False behaviour differs across supported Python/platform
+        # combinations.  Walk links explicitly and fail closed on a repeated
+        # link (or an excessive chain), including links in parent components.
+        target = resolve_links_fail_closed(candidate)
+    except (OSError, RuntimeError, ValueError) as error:
+        return None, f"Could not safely resolve write target {raw_path!r}: {error}"
+    if not path_is_within(target, root):
+        return target, (
+            f"Blocked write outside workspace {root}: {raw_path} resolves to {target}"
+        )
+    return target, None
+
+
+def resolve_links_fail_closed(path: Path) -> Path:
+    """Resolve existing symlinks while explicitly rejecting link cycles."""
+    candidate = Path(os.path.abspath(path))
+    followed: set[Path] = set()
+    for _ in range(41):
+        current = Path(candidate.anchor)
+        replaced = False
+        for component in candidate.parts[1:]:
+            current /= component
+            try:
+                is_link = stat.S_ISLNK(os.lstat(current).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                is_link = False
+            if not is_link:
+                continue
+            link = Path(os.path.abspath(current))
+            if link in followed or len(followed) >= 40:
+                raise RuntimeError(f"symlink resolution loop at {link}")
+            followed.add(link)
+            destination = Path(os.readlink(current))
+            if not destination.is_absolute():
+                destination = current.parent / destination
+            remainder = candidate.parts[len(current.parts) :]
+            candidate = Path(os.path.abspath(destination.joinpath(*remainder)))
+            replaced = True
+            break
+        if not replaced:
+            return candidate
+    raise RuntimeError(f"too many symlinks while resolving {path}")
+
+
+def workspace_boundary_result(
+    event: Mapping[str, Any], workspace_root: Path
+) -> HookResult | None:
+    tool = event.get("tool") or {}
+    if not tool_has_effect(tool, "filesystem_write"):
+        return None
+    files = boundary_tool_files(tool)
+    if not files:
+        return HookResult(
+            "deny",
+            exit_code=2,
+            message=(
+                "Blocked filesystem mutation because no target path was reported; "
+                "the workspace boundary could not be verified"
+            ),
+        )
+    for raw_path in files:
+        _, error = resolve_workspace_target(raw_path, event.get("cwd"), workspace_root)
+        if error:
+            return HookResult("deny", exit_code=2, message=error)
+    return None
+
+
+def strict_context_problem(
+    cwd: str | Path | None,
+    *,
+    home: Path | None = None,
+    effective_uid: int | None = None,
+) -> str | None:
+    """Return why a mutation context is unsafe for the opt-in strict profile."""
+    try:
+        working_directory = Path(cwd or os.getcwd()).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        return f"cwd could not be resolved: {error}"
+    if not working_directory.is_dir():
+        return f"cwd is not a directory: {working_directory}"
+    try:
+        resolved_home = (home or Path.home()).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        return f"home directory could not be resolved: {error}"
+    if working_directory == Path(working_directory.anchor):
+        return f"cwd is filesystem root: {working_directory}"
+    if working_directory in {resolved_home, Path("/root")}:
+        return f"cwd is a home/root directory: {working_directory}"
+    uid = effective_uid
+    if uid is None and hasattr(os, "geteuid"):
+        uid = os.geteuid()
+    if uid == 0:
+        return "the hook process is running as root"
+    if git_repository_root(working_directory) is None:
+        return f"cwd is not inside a Git repository/worktree: {working_directory}"
+    return None
+
+
 def evaluate(
     event: dict[str, Any],
     config: dict[str, Any],
     quality_trusted: bool = True,
+    workspace_root: Path | None = None,
+    config_valid: bool = True,
 ) -> HookResult:
+    workspace_root = workspace_root or canonical_repository_root(event.get("cwd"))
+    boundary_result = workspace_boundary_result(event, workspace_root)
+    if boundary_result is not None:
+        return boundary_result
+
+    strict, strict_error = strict_workspace_enabled(config)
+    tool = event.get("tool") or {}
+    if tool_has_effect(tool, "filesystem_write") and strict_error:
+        return HookResult("deny", exit_code=2, message=strict_error)
+    if tool_has_effect(tool, "filesystem_write") and strict:
+        problem = strict_context_problem(event.get("cwd"))
+        if problem:
+            return HookResult(
+                "deny",
+                exit_code=2,
+                message=f"Strict workspace mode blocked mutation: {problem}",
+            )
+
+    config_error = (
+        "Blocked filesystem mutation because the repository configuration "
+        "is invalid or unreadable"
+    )
     if event.get("event") == "after_tool":
+        if tool_has_effect(tool, "filesystem_write") and not config_valid:
+            return HookResult("deny", exit_code=2, message=config_error)
         if not quality_trusted:
             return HookResult("allow")
         return run_quality_commands(event, config)
     if event.get("event") != "before_tool":
+        if tool_has_effect(tool, "filesystem_write") and not config_valid:
+            return HookResult("deny", exit_code=2, message=config_error)
         return HookResult("allow")
 
-    tool = event.get("tool") or {}
     command = str(tool.get("command") or "")
     if tool_has_effect(tool, "shell_execute"):
         command = shell_executable_text(command)
@@ -655,6 +860,8 @@ def evaluate(
                     exit_code=2,
                     message=f"Blocked protected path: {file_path}",
                 )
+        if not config_valid:
+            return HookResult("deny", exit_code=2, message=config_error)
 
     return HookResult("allow")
 
@@ -770,7 +977,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="revoke executable quality configuration trust",
     )
     untrust.add_argument("--repository", type=Path, default=Path.cwd())
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="inspect whether a working directory is a safe agent launch context",
+    )
+    doctor.add_argument("--cwd", type=Path, default=Path.cwd())
+    doctor.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat running as root as an unsafe launch context",
+    )
     return parser
+
+
+def doctor_checks(
+    cwd: Path,
+    *,
+    home: Path | None = None,
+    effective_uid: int | None = None,
+) -> list[tuple[Literal["ok", "warn", "fail"], str]]:
+    checks: list[tuple[Literal["ok", "warn", "fail"], str]] = []
+    try:
+        working_directory = cwd.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        return [("fail", f"cwd cannot be resolved: {error}")]
+    if not working_directory.is_dir():
+        return [("fail", f"cwd is not a directory: {working_directory}")]
+    checks.append(("ok", f"cwd exists and is a directory: {working_directory}"))
+
+    try:
+        resolved_home = (home or Path.home()).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        checks.append(("fail", f"home directory cannot be resolved: {error}"))
+        resolved_home = Path("/__agent_hooks_invalid_home__")
+    if working_directory == Path(working_directory.anchor):
+        checks.append(("fail", "cwd is the filesystem root"))
+    elif working_directory in {resolved_home, Path("/root")}:
+        checks.append(("fail", "cwd is a home/root directory"))
+    else:
+        checks.append(("ok", "cwd is not filesystem root or a home directory"))
+
+    repository_root = git_repository_root(working_directory)
+    if repository_root is None:
+        checks.append(("fail", "cwd is not inside a Git repository/worktree"))
+        workspace_root = working_directory
+    else:
+        checks.append(("ok", f"Git workspace root: {repository_root}"))
+        workspace_root = repository_root
+
+    uid = effective_uid
+    if uid is None and hasattr(os, "geteuid"):
+        uid = os.geteuid()
+    if uid == 0:
+        checks.append(("warn", "hook process is running as root"))
+    elif uid is not None:
+        checks.append(("ok", f"effective uid is non-root: {uid}"))
+    else:
+        checks.append(("warn", "effective uid is unavailable on this platform"))
+
+    try:
+        store_path = trust_store_path()
+        if path_is_within(store_path, workspace_root):
+            checks.append(("fail", f"trust store is inside workspace: {store_path}"))
+        else:
+            checks.append(("ok", f"trust store is outside workspace: {store_path}"))
+    except (OSError, RuntimeError, ValueError) as error:
+        checks.append(("fail", f"trust-store location cannot be resolved: {error}"))
+    checks.append(
+        (
+            "warn",
+            "native agent sandbox status cannot be proven by hooks; keep it enabled",
+        )
+    )
+    return checks
+
+
+def run_doctor(cwd: Path, strict: bool) -> int:
+    checks = doctor_checks(cwd)
+    for status, message in checks:
+        effective_status = "fail" if strict and status == "warn" and "running as root" in message else status
+        print(f"[{effective_status}] {message}")
+    failed = any(
+        status == "fail" or (strict and status == "warn" and "running as root" in message)
+        for status, message in checks
+    )
+    return 2 if failed else 0
 
 
 def trust_repository(repository: Path | None, config_path: Path | None) -> int:
@@ -893,6 +1184,8 @@ def main() -> int:
         return trust_repository(args.repository, args.config)
     if args.command == "untrust":
         return untrust_repository(args.repository)
+    if args.command == "doctor":
+        return run_doctor(args.cwd, args.strict)
 
     raw_event = json.load(sys.stdin)
     adapter = resolve_adapter(args.adapter, raw_event)
@@ -909,7 +1202,13 @@ def main() -> int:
         trust_warning,
         skipped_quality_warning(loaded) if quality_skipped else None,
     )
-    result = evaluate(event, loaded.config, quality_trusted)
+    result = evaluate(
+        event,
+        loaded.config,
+        quality_trusted,
+        workspace_root=loaded.repository_root,
+        config_valid=loaded.valid,
+    )
     exit_code, output = render(adapter, event, result, warning)
     json.dump(output, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")

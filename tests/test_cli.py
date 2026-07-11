@@ -1,5 +1,6 @@
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from typing import Literal
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "plugins" / "coding-agent-hooks" / "bin" / "agent-hooks"
+RUNTIME = runpy.run_path(str(CLI), run_name="agent_hooks_test")
 
 
 class PortableHookCliTests(unittest.TestCase):
@@ -31,6 +33,46 @@ class PortableHookCliTests(unittest.TestCase):
             capture_output=True,
             check=False,
             env=environment,
+        )
+
+    def make_git_repository(self, path: Path, worktree: bool = False) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        if worktree:
+            git_directory = path.parent / f".{path.name}-gitdir"
+            git_directory.mkdir()
+            (git_directory / "HEAD").write_text(
+                "ref: refs/heads/main\n", encoding="utf-8"
+            )
+            relative_git_directory = os.path.relpath(git_directory, path)
+            (path / ".git").write_text(
+                f"gitdir: {relative_git_directory}\n",
+                encoding="utf-8",
+            )
+        else:
+            (path / ".git").mkdir()
+            (path / ".git" / "HEAD").write_text(
+                "ref: refs/heads/main\n", encoding="utf-8"
+            )
+
+    def write_event(
+        self,
+        cwd: Path,
+        files: list[str],
+        *,
+        event_name: str = "before_tool",
+        environment: dict[str, str] | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": event_name,
+                "cwd": str(cwd),
+                "agent": "test",
+                "tool": {"name": "write", "files": files},
+            },
+            environment=environment,
+            config=config,
         )
 
     def trust_environment(self, base: Path) -> dict[str, str]:
@@ -401,6 +443,336 @@ class PortableHookCliTests(unittest.TestCase):
                 ),
             },
         )
+
+    def test_workspace_boundary_allows_nested_repo_and_worktree_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for name, worktree in (("repo", False), ("worktree", True)):
+                with self.subTest(name=name):
+                    repository = base / name
+                    self.make_git_repository(repository, worktree=worktree)
+                    nested = repository / "src" / "nested"
+                    nested.mkdir(parents=True)
+                    relative = self.write_event(nested, ["module.py"])
+                    absolute = self.write_event(
+                        nested, [str(repository / "other.py")]
+                    )
+                    self.assertEqual(relative.returncode, 0, relative.stdout)
+                    self.assertEqual(absolute.returncode, 0, absolute.stdout)
+
+    def test_non_git_cwd_is_the_direct_file_workspace_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            inside = self.write_event(cwd, ["inside.txt"])
+            outside = self.write_event(cwd, [str(cwd.parent / "outside.txt")])
+        self.assertEqual(inside.returncode, 0)
+        self.assertEqual(outside.returncode, 2)
+        self.assertIn("Blocked write outside workspace", outside.stdout)
+
+    def test_absolute_outside_and_parent_escape_are_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            self.make_git_repository(repository)
+            for target in (str(base / "outside.txt"), "../outside.txt"):
+                with self.subTest(target=target):
+                    result = self.write_event(repository, [target])
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(
+                        "Blocked write outside workspace",
+                        json.loads(result.stdout)["message"],
+                    )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_symlink_and_nonexistent_symlink_parent_escapes_are_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            outside = base / "outside"
+            self.make_git_repository(repository)
+            outside.mkdir()
+            try:
+                (repository / "link").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlink creation unavailable: {error}")
+            for target in ("link/existing.txt", "link/new/deep/file.txt"):
+                with self.subTest(target=target):
+                    result = self.write_event(repository, [target])
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("outside workspace", result.stdout)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_terminal_and_parent_symlink_loops_fail_closed_before_and_after(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            self.make_git_repository(repository)
+            try:
+                (repository / "loop").symlink_to("loop")
+            except OSError as error:
+                self.skipTest(f"symlink creation unavailable: {error}")
+            marker = repository / "quality-ran"
+            config = repository / ".agent-hooks.json"
+            self.write_quality_config(
+                config, "from pathlib import Path; Path('quality-ran').touch()"
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(repository, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+
+            for target in ("loop", "loop/file.py"):
+                for event_name in ("before_tool", "after_tool"):
+                    with self.subTest(target=target, event_name=event_name):
+                        result = self.write_event(
+                            repository,
+                            [target],
+                            event_name=event_name,
+                            environment=environment,
+                        )
+                        self.assertEqual(result.returncode, 2, result.stdout)
+                        self.assertIn(
+                            "Could not safely resolve write target", result.stdout
+                        )
+                        self.assertFalse(marker.exists())
+
+    def test_every_file_and_apply_patch_move_destination_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            self.make_git_repository(repository)
+            multiple = self.write_event(
+                repository, ["safe.txt", str(base / "outside.txt")]
+            )
+            moved = self.run_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(repository),
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "command": (
+                            "*** Begin Patch\n*** Update File: safe.txt\n"
+                            "*** Move to: ../outside.txt\n*** End Patch\n"
+                        )
+                    },
+                },
+                adapter="codex",
+            )
+        self.assertEqual(multiple.returncode, 2)
+        self.assertIn("outside workspace", multiple.stdout)
+        self.assertIn("permissionDecision\":\"deny", moved.stdout)
+        self.assertIn("outside workspace", moved.stdout)
+
+    def test_read_only_outside_path_is_unaffected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            self.make_git_repository(repository)
+            result = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(repository),
+                    "agent": "test",
+                    "tool": {"name": "read", "file": "/etc/hosts"},
+                }
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"decision": "allow"})
+
+    def test_filesystem_effect_without_a_target_fails_closed(self) -> None:
+        result = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {"name": "future-writer", "effect": "filesystem_write"},
+            }
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("no target path was reported", result.stdout)
+
+    def test_outside_after_write_target_cannot_run_quality_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            self.make_git_repository(repository)
+            marker = repository / "quality-ran"
+            config = repository / ".agent-hooks.json"
+            self.write_quality_config(
+                config, "from pathlib import Path; Path('quality-ran').touch()"
+            )
+            environment = self.trust_environment(base)
+            trust = self.run_trust_command(repository, environment)
+            self.assertEqual(trust.returncode, 0, trust.stderr)
+            result = self.write_event(
+                repository,
+                [str(base / "outside.py")],
+                event_name="after_tool",
+                environment=environment,
+            )
+            self.assertFalse(marker.exists())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside workspace", result.stdout)
+
+    def test_doctor_reports_safe_and_unsafe_launch_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repository = base / "repo"
+            self.make_git_repository(repository)
+            environment = self.trust_environment(base)
+            safe = subprocess.run(
+                [str(CLI), "doctor", "--cwd", str(repository)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+            unsafe = subprocess.run(
+                [str(CLI), "doctor", "--cwd", str(base)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+        self.assertEqual(safe.returncode, 0, safe.stdout)
+        self.assertIn("Git workspace root", safe.stdout)
+        self.assertIn("sandbox status cannot be proven", safe.stdout)
+        self.assertEqual(unsafe.returncode, 2)
+        self.assertIn("not inside a Git repository", unsafe.stdout)
+
+    def test_strict_mode_blocks_root_and_non_repository_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            environment = os.environ.copy()
+            environment["AGENT_HOOKS_STRICT_WORKSPACE"] = "true"
+            non_repository = self.write_event(
+                base, ["file.txt"], environment=environment
+            )
+            home = self.write_event(
+                Path.home(), ["file.txt"], environment=environment
+            )
+        self.assertEqual(non_repository.returncode, 2)
+        self.assertIn("Strict workspace mode blocked mutation", non_repository.stdout)
+        self.assertEqual(home.returncode, 2)
+        self.assertIn("home/root directory", home.stdout)
+
+    def test_strict_context_root_check_uses_injected_effective_uid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            self.make_git_repository(repository)
+            strict_context_problem = RUNTIME["strict_context_problem"]
+            root_problem = strict_context_problem(
+                repository,
+                home=repository.parent / "different-home",
+                effective_uid=0,
+            )
+            non_root_problem = strict_context_problem(
+                repository,
+                home=repository.parent / "different-home",
+                effective_uid=1000,
+            )
+        self.assertEqual(root_problem, "the hook process is running as root")
+        self.assertIsNone(non_root_problem)
+
+    def test_strict_workspace_config_must_be_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "agent-hooks.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "safety": {"strict_workspace": "yes"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self.write_event(ROOT, ["safe.txt"], config=config)
+        self.assertEqual(result.returncode, 2)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "deny")
+        self.assertIn("configuration is invalid or unreadable", output["message"])
+        self.assertIn("strict_workspace must be a boolean", output["warning"])
+
+    def test_invalid_explicit_config_blocks_writes_but_allows_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.make_git_repository(project)
+            config = project / "broken.json"
+            config.write_text("{not-json", encoding="utf-8")
+            write = self.write_event(project, ["safe.txt"], config=config)
+            read = self.run_hook(
+                {
+                    "schema": "agent-hooks/v1",
+                    "event": "before_tool",
+                    "cwd": str(project),
+                    "agent": "test",
+                    "tool": {"name": "read", "file": "README.md"},
+                },
+                config=config,
+            )
+        self.assertEqual(write.returncode, 2)
+        self.assertIn("configuration is invalid or unreadable", write.stdout)
+        self.assertEqual(read.returncode, 0)
+        self.assertIn("Ignoring invalid configuration", read.stdout)
+
+    def test_invalid_discovered_config_blocks_before_and_after_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.make_git_repository(project)
+            (project / ".agent-hooks.json").write_text(
+                "{not-json", encoding="utf-8"
+            )
+            results = [
+                self.write_event(project, ["safe.txt"], event_name=event_name)
+                for event_name in ("before_tool", "after_tool")
+            ]
+        for result in results:
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("configuration is invalid or unreadable", result.stdout)
+
+    def test_non_file_discovered_config_blocks_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.make_git_repository(project)
+            (project / ".agent-hooks.json").mkdir()
+            result = self.write_event(project, ["safe.txt"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("configuration is invalid or unreadable", result.stdout)
+
+    def test_invalid_git_file_markers_are_not_worktrees(self) -> None:
+        git_repository_root = RUNTIME["git_repository_root"]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            cases = {
+                "empty": "",
+                "malformed": "not-a-gitdir\n",
+                "multiple-lines": "gitdir: metadata\nextra\n",
+                "dangling": "gitdir: missing-metadata\n",
+            }
+            for name, marker in cases.items():
+                with self.subTest(name=name):
+                    project = base / name
+                    project.mkdir()
+                    (project / ".git").write_text(marker, encoding="utf-8")
+                    self.assertIsNone(git_repository_root(project))
+
+    def test_invalid_strict_mode_value_fails_closed_only_for_mutations(self) -> None:
+        environment = os.environ.copy()
+        environment["AGENT_HOOKS_STRICT_WORKSPACE"] = "sometimes"
+        write = self.write_event(ROOT, ["safe.txt"], environment=environment)
+        read = self.run_hook(
+            {
+                "schema": "agent-hooks/v1",
+                "event": "before_tool",
+                "cwd": str(ROOT),
+                "agent": "test",
+                "tool": {"name": "read", "file": "README.md"},
+            },
+            environment=environment,
+        )
+        self.assertEqual(write.returncode, 2)
+        self.assertIn("must be one of", write.stdout)
+        self.assertEqual(read.returncode, 0)
 
     def test_configured_after_write_command_runs_for_matching_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1333,6 +1705,54 @@ class PortableHookCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), {})
+
+    def test_codex_post_patch_outside_delete_or_move_never_runs_quality(self) -> None:
+        patches = {
+            "delete": (
+                "*** Begin Patch\n"
+                "*** Delete File: ../outside.py\n"
+                "*** End Patch"
+            ),
+            "move-source": (
+                "*** Begin Patch\n"
+                "*** Update File: ../outside.py\n"
+                "*** Move to: moved.py\n"
+                "@@\n-old\n+new\n"
+                "*** End Patch"
+            ),
+            "move-destination": (
+                "*** Begin Patch\n"
+                "*** Update File: source.py\n"
+                "*** Move to: ../outside.py\n"
+                "@@\n-old\n+new\n"
+                "*** End Patch"
+            ),
+        }
+        for name, patch in patches.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                project = base / "project"
+                project.mkdir()
+                config = self.write_path_recording_quality_config(project)
+                environment = self.trust_environment(base)
+                trust = self.run_trust_command(project, environment, config=config)
+                self.assertEqual(trust.returncode, 0, trust.stderr)
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "cwd": str(project),
+                        "tool_name": "apply_patch",
+                        "tool_input": {"command": patch},
+                    },
+                    adapter="codex",
+                    config=config,
+                    environment=environment,
+                )
+                self.assertFalse((project / "quality-paths").exists())
+                output = json.loads(result.stdout)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(output["decision"], "block")
+                self.assertIn("outside workspace", output["reason"])
 
     def test_quality_commands_do_not_run_after_read_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

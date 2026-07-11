@@ -1,7 +1,8 @@
 {
   "version": 1,
   "safety": {
-    "additional_protected_paths": ["production/**"]
+    "additional_protected_paths": ["production/**"],
+    "strict_workspace": false
   },
   "quality": {
     "after_write": [
