@@ -41,8 +41,10 @@ DESTRUCTIVE_COMMANDS = (
     (re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE), "git reset --hard"),
     (
         re.compile(
-            r"\bgit\s+push\b[^\n]*\s--force"
-            r"(?:-with-lease(?:=[^\s;&|]+)?)?(?=\s|[;&|]|$)",
+            r"\bgit\s+push\b"
+            r"(?:(?!\s--(?=\s|[;&|]|$))[^;&|\n])*\s(?:"
+            r"--force(?:-with-lease(?:=[^\s;&|]+)?)?|-f"
+            r")(?=\s|[;&|]|$)",
             re.IGNORECASE,
         ),
         "git push --force",
@@ -165,7 +167,7 @@ ADAPTERS = {
 }
 
 PATCH_FILE_PATTERN = re.compile(
-    r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
+    r"^\*\*\* ((?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE
 )
 
 DEFAULT_PROTECTED_PATHS = (
@@ -182,16 +184,25 @@ TRUST_STORE_ENV = "AGENT_HOOKS_TRUST_STORE"
 TRUST_STORE_VERSION = 1
 TRUST_DIGEST_FIELD = "quality_after_write_sha256"
 
+CANONICAL_EFFECTS = frozenset(
+    {"filesystem_write", "shell_execute", "read_only", "unknown"}
+)
+
+# Raw vendor tool names are intentionally confined to this adapter seam. Shared
+# policy below consumes only the normalized ``tool.effect`` value.
 WRITE_TOOL_NAMES = {
     "apply_patch",
     "create_file",
     "edit",
     "editfiles",
+    "inserteditintofile",
     "insert_edit_into_file",
     "multiedit",
+    "multireplacestringinfile",
     "multi_replace_string_in_file",
     "notebookedit",
     "replace",
+    "replacestringinfile",
     "replace_string_in_file",
     "write",
     "write_file",
@@ -200,6 +211,7 @@ WRITE_TOOL_NAMES = {
 SHELL_TOOL_NAMES = {
     "bash",
     "execute",
+    "exec_command",
     "monitor",
     "powershell",
     "run_command",
@@ -208,6 +220,22 @@ SHELL_TOOL_NAMES = {
     "runinterminal",
     "runterminalcommand",
     "shell",
+}
+
+READ_TOOL_NAMES = {
+    "glob",
+    "grep",
+    "list_directory",
+    "listdirectory",
+    "read",
+    "read_file",
+    "readfile",
+    "read_many_files",
+    "readmanyfiles",
+    "search_file_content",
+    "searchfilecontent",
+    "webfetch",
+    "websearch",
 }
 
 VSCODE_TOOL_NAMES = {
@@ -221,27 +249,72 @@ VSCODE_TOOL_NAMES = {
 def normalize(adapter: str, raw: dict[str, Any]) -> dict[str, Any]:
     adapter_spec = ADAPTERS[adapter]
     if adapter_spec.event_names is None:
-        return raw
+        event = dict(raw)
+        raw_tool = raw.get("tool") or {}
+        tool = dict(raw_tool) if isinstance(raw_tool, dict) else {}
+        tool["effect"] = classify_effect(tool)
+        event["tool"] = tool
+        return event
 
     tool_input = raw.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
     tool_name = raw.get("tool_name") or ""
-    files = extract_files(tool_name, tool_input)
+    event_name = adapter_spec.event_names.get(
+        raw.get("hook_event_name"), "unknown"
+    )
+    files = extract_files(
+        tool_name,
+        tool_input,
+        after_tool=event_name == "after_tool",
+    )
     return {
         "schema": "agent-hooks/v1",
-        "event": adapter_spec.event_names.get(
-            raw.get("hook_event_name"), "unknown"
-        ),
+        "event": event_name,
         "cwd": raw.get("cwd"),
         "agent": adapter,
         "tool": {
             "name": tool_name,
+            "effect": classify_effect(
+                {
+                    "name": tool_name,
+                    "command": tool_input.get("command"),
+                    "files": files,
+                }
+            ),
             "command": tool_input.get("command"),
             "file": files[0] if files else None,
             "files": files,
         },
     }
+
+
+def classify_effect(tool: Mapping[str, Any]) -> str:
+    """Return the stable policy effect for an adapter or canonical tool."""
+    explicit_effect = tool.get("effect")
+    if (
+        isinstance(explicit_effect, str)
+        and explicit_effect in CANONICAL_EFFECTS
+        and explicit_effect != "unknown"
+    ):
+        return explicit_effect
+
+    tool_name = str(tool.get("name") or "").lower()
+    if tool_name in WRITE_TOOL_NAMES:
+        return "filesystem_write"
+    if tool_name in SHELL_TOOL_NAMES:
+        return "shell_execute"
+    if tool_name in READ_TOOL_NAMES:
+        return "read_only"
+
+    # Payload-shape fallback prevents new/unknown vendor aliases from bypassing
+    # destructive-command or protected-path checks. A known read alias was
+    # already returned above, so its file target remains readable.
+    if tool.get("command") is not None:
+        return "shell_execute"
+    if tool_files(tool):
+        return "filesystem_write"
+    return "unknown"
 
 
 def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
@@ -255,7 +328,12 @@ def resolve_adapter(adapter: str, raw: Mapping[str, Any]) -> str:
     return "claude"
 
 
-def extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
+def extract_files(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    after_tool: bool = False,
+) -> list[str]:
     files: list[str] = []
     direct_path = (
         tool_input.get("file_path")
@@ -276,7 +354,21 @@ def extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
 
     if tool_name.lower() == "apply_patch":
         command = tool_input.get("command") or ""
-        files.extend(PATCH_FILE_PATTERN.findall(command))
+        patch_files = PATCH_FILE_PATTERN.findall(command)
+        if after_tool:
+            for index, (action, path) in enumerate(patch_files):
+                next_action = (
+                    patch_files[index + 1][0]
+                    if index + 1 < len(patch_files)
+                    else None
+                )
+                if action == "Delete File":
+                    continue
+                if action == "Update File" and next_action == "Move to":
+                    continue
+                files.append(path)
+        else:
+            files.extend(path for _, path in patch_files)
 
     return list(dict.fromkeys(files))
 
@@ -521,7 +613,7 @@ def evaluate(
 
     tool = event.get("tool") or {}
     command = str(tool.get("command") or "")
-    if str(tool.get("name") or "").lower() in SHELL_TOOL_NAMES:
+    if tool.get("effect") == "shell_execute":
         command = shell_executable_text(command)
         for pattern, label in DESTRUCTIVE_COMMANDS:
             if pattern.search(command):
@@ -536,7 +628,7 @@ def evaluate(
         "additional_protected_paths", []
     )
     protected_paths = (*DEFAULT_PROTECTED_PATHS, *extra_paths)
-    if str(tool.get("name") or "").lower() in WRITE_TOOL_NAMES:
+    if tool.get("effect") == "filesystem_write":
         for file_path in file_paths:
             if any(path_matches(file_path, pattern) for pattern in protected_paths):
                 return HookResult(
@@ -554,7 +646,7 @@ def quality_commands_applicable(
     if event.get("event") != "after_tool":
         return False
     tool = event.get("tool") or {}
-    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+    if tool.get("effect") != "filesystem_write":
         return False
     file_paths = tool_files(tool)
     for file_path in file_paths:
@@ -571,7 +663,7 @@ def run_quality_commands(
     event: dict[str, Any], config: dict[str, Any]
 ) -> HookResult:
     tool = event.get("tool") or {}
-    if str(tool.get("name") or "").lower() not in WRITE_TOOL_NAMES:
+    if tool.get("effect") != "filesystem_write":
         return HookResult("allow")
     file_paths = tool_files(tool)
     if not file_paths:
