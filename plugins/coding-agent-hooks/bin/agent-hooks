@@ -18,6 +18,7 @@ from typing import Any, Literal, Mapping
 SHELL_COMMAND_START = (
     r"(?:^|[;&|(){}`\n]\s*)"
     r"(?:(?:then|do|else)\s+)?"
+    r"(?:[A-Za-z_]\w*=[^\s;&|(){}]*\s+)*"
     r"(?:(?:(?:sudo|doas)"
     r"(?:\s+(?:-u\s+[^\s;&|(){}]+|--user(?:=[^\s;&|(){}]+|\s+[^\s;&|(){}]+)|-[^\s;&|(){}]+))*"
     r"|(?:command|exec|env|nohup|time)"
